@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.25,<2.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyxle-auth"
+version = "0.1.0"
+description = "Session-based email+password auth for Pyxle apps: argon2id hashing, CSRF-friendly cookies, per-identity rate limits."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Pyxle", email = "dev@pyxle.dev" },
+]
+keywords = ["pyxle", "auth", "sessions", "argon2"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: AsyncIO",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+]
+dependencies = [
+  "pyxle-framework>=0.2.4",
+  "pyxle-db>=0.1.0",
+  "argon2-cffi>=23.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+]
+
+[project.urls]
+Homepage = "https://pyxle.dev"
+Source = "https://github.com/pyxle-framework/pyxle-plugins"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyxle_auth"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

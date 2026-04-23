@@ -1,0 +1,100 @@
+"""Domain objects returned from :class:`pyxle_auth.AuthService`.
+
+Everything is a ``frozen=True`` dataclass — the auth service never
+mutates what it returns. Handlers can pass these into other layers
+without worrying about someone silently editing the email address.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class User:
+    """A user account.
+
+    The ``password_hash`` field is populated only on the version held
+    internally by the service — the version handed to request handlers
+    via :meth:`AuthService.with_user` never includes it.
+    """
+
+    id: str
+    email: str
+    email_verified_at: datetime | None
+    created_at: datetime
+    plan: str
+
+
+@dataclass(frozen=True, slots=True)
+class Session:
+    """An active session row.
+
+    ``token_sha256`` is the hash stored in the DB; the raw token that
+    the browser holds lives in a :class:`SessionCookie`.
+    """
+
+    token_sha256: str
+    user_id: str
+    created_at: datetime
+    expires_at: datetime
+    user_agent: str | None
+    ip: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCookie:
+    """Cookie attributes for a session.
+
+    Pass the result of :meth:`kwargs` straight into Starlette's
+    ``response.set_cookie(**cookie.kwargs())``.
+    """
+
+    name: str
+    value: str
+    max_age: int
+    secure: bool
+    http_only: bool = True
+    samesite: str = "Lax"
+    path: str = "/"
+    domain: str | None = None
+
+    def kwargs(self) -> dict[str, Any]:
+        """Return a dict shaped for ``Starlette response.set_cookie``."""
+        out: dict[str, Any] = {
+            "key": self.name,
+            "value": self.value,
+            "max_age": self.max_age,
+            "httponly": self.http_only,
+            "secure": self.secure,
+            "samesite": self.samesite.lower(),
+            "path": self.path,
+        }
+        if self.domain is not None:
+            out["domain"] = self.domain
+        return out
+
+    @classmethod
+    def delete(cls, name: str, *, domain: str | None = None, path: str = "/") -> "SessionCookie":
+        """Produce a cookie that instructs the browser to drop ours."""
+        return cls(
+            name=name,
+            value="",
+            max_age=0,
+            secure=False,
+            http_only=True,
+            samesite="Lax",
+            path=path,
+            domain=domain,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers used by the service
+
+
+def _now_utc() -> datetime:
+    """Wrap ``datetime.now`` so tests can monkeypatch a single call site."""
+    return datetime.now(tz=timezone.utc)

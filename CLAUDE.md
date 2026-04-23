@@ -1,12 +1,6 @@
 # CLAUDE.md — Pyxle Official Plugins
 
-This repository contains official plugins for the Pyxle framework.
-
-## Related Repositories
-
-- `pyxle` — Core framework (all plugins depend on it)
-- `pyxle-langkit` — Language tools and IDE support
-- `pyxle-dev` — Private repo for pyxle.dev website
+Official plugins for the Pyxle framework. Each plugin is an independent Python package.
 
 ---
 
@@ -57,3 +51,4 @@ dependencies = [
 - Follow the same coding standards as `pyxle` core (frozen dataclasses, type hints, async I/O)
 - Each plugin must have its own test suite
 - Plugins must not monkey-patch or modify pyxle core internals -- use public APIs only
+- **Always ask for explicit user confirmation before committing or deploying**
