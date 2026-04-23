@@ -111,3 +111,28 @@ async def test_missing_migrations_dir_is_silent(tmp_path: Path) -> None:
         assert isinstance(db, Database)
     finally:
         await run_shutdown([plugin], ctx)
+
+
+@pytest.mark.anyio
+async def test_get_database_shortcut_resolves_via_active_context(
+    tmp_path: Path,
+) -> None:
+    """``from pyxle_db import get_database`` is the Django-style short
+    form — it should return the same instance as
+    ``ctx.require('db.database')`` once the devserver's lifespan has
+    set the active context."""
+    from pyxle.plugins import set_active_context
+    from pyxle_db import get_database
+
+    spec = PluginSpec.from_config_entry("pyxle-db")
+    [plugin] = load_plugins([spec])
+    ctx = PluginContext(settings=_FakeSettings(project_root=tmp_path))
+    await run_startup([plugin], ctx)
+    set_active_context(ctx)
+    try:
+        direct = ctx.require("db.database")
+        shortcut = get_database()
+        assert shortcut is direct
+    finally:
+        set_active_context(None)
+        await run_shutdown([plugin], ctx)

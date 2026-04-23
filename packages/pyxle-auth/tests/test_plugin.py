@@ -137,3 +137,40 @@ async def test_unknown_settings_key_surfaces_clearly(tmp_path: Path) -> None:
     ctx = PluginContext(settings=_FakeSettings(project_root=tmp_path))
     with pytest.raises(PluginError, match="cookeiSecure"):
         await run_startup(plugins, ctx)
+
+
+@pytest.mark.anyio
+async def test_get_auth_service_and_settings_shortcuts(tmp_path: Path) -> None:
+    """Django-style import helpers return the same instances
+    ``request.app.state.pyxle_plugins.require(...)`` would, once the
+    devserver's lifespan has installed the active context."""
+    from pyxle.plugins import set_active_context
+    from pyxle_auth import AuthService, AuthSettings, get_auth_service, get_auth_settings
+
+    entries = [
+        {"name": "pyxle-db", "settings": {"path": "app.db"}},
+        {
+            "name": "pyxle-auth",
+            "settings": {
+                "argonTimeCost": 1,
+                "argonMemoryKib": 8,
+                "argonParallelism": 1,
+                "cookieSecure": False,
+                "strict": False,
+            },
+        },
+    ]
+    specs = [PluginSpec.from_config_entry(e) for e in entries]
+    plugins = load_plugins(specs)
+    ctx = PluginContext(settings=_FakeSettings(project_root=tmp_path))
+    await run_startup(plugins, ctx)
+    set_active_context(ctx)
+    try:
+        # Shortcut returns the exact instance the registry holds.
+        assert get_auth_service() is ctx.require("auth.service")
+        assert isinstance(get_auth_service(), AuthService)
+        # Same for settings.
+        assert get_auth_settings() is ctx.require("auth.settings")
+        assert isinstance(get_auth_settings(), AuthSettings)
+    finally:
+        set_active_context(None)

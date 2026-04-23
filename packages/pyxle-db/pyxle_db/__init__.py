@@ -35,6 +35,30 @@ from pyxle_db.errors import (
 )
 from pyxle_db.migrator import Migration, Migrator
 
+
+def get_database() -> Database:
+    """Return the :class:`Database` the active ``pyxle-db`` plugin opened.
+
+    Short form for app code that wants the database without reaching
+    through ``request.app.state.pyxle_plugins``::
+
+        from pyxle_db import get_database
+
+        @server
+        async def load(request):
+            db = get_database()
+            row = await db.fetchone("SELECT ... FROM ...")
+
+    Requires ``pyxle-db`` to be listed in ``pyxle.config.json::plugins``
+    — otherwise raises :class:`pyxle.plugins.PluginServiceError`.
+    """
+    from pyxle.plugins import plugin as _plugin  # local import to
+    # avoid pyxle-db depending on pyxle at module-load time; the plugin
+    # system is only needed at *call* time.
+
+    return _plugin("db.database")
+
+
 __all__ = [
     "Database",
     "Transaction",
@@ -46,6 +70,7 @@ __all__ = [
     "NotFoundError",
     "MigrationError",
     "MigrationChecksumMismatch",
+    "get_database",
 ]
 
 __version__ = "0.1.0"
