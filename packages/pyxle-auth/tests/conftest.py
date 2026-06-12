@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import AsyncIterator
 
 import pytest
 
@@ -9,12 +10,12 @@ from pyxle_db import Database, connect
 
 
 @pytest.fixture
-async def db(tmp_path: Path) -> Database:
+async def db(tmp_path: Path) -> AsyncIterator[Database]:
     db = await connect(tmp_path / "auth.db")
     try:
         yield db
     finally:
-        db.close()
+        await db.aclose()
 
 
 @pytest.fixture

@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-auth"
-version = "0.1.0"
-description = "Session-based email+password auth for Pyxle apps: argon2id hashing, CSRF-friendly cookies, per-identity rate limits."
+version = "0.2.0"
+description = "Authentication plugin for Pyxle: argon2id sessions, password reset and email verification flows, RBAC, scoped API tokens, and request guards."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
   { name = "Pyxle", email = "dev@pyxle.dev" },
 ]
-keywords = ["pyxle", "auth", "sessions", "argon2"]
+keywords = ["pyxle", "auth", "sessions", "argon2", "rbac", "tokens"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Framework :: AsyncIO",
@@ -21,11 +21,13 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Security",
 ]
 dependencies = [
-  "pyxle-framework>=0.2.4",
-  "pyxle-db>=0.1.0",
+  "pyxle-framework>=0.4.0",
+  "pyxle-db>=0.2.0",
   "argon2-cffi>=23.1",
 ]
 
@@ -37,9 +39,12 @@ dev = [
 
 [project.urls]
 Homepage = "https://pyxle.dev"
-Source = "https://github.com/pyxle-framework/pyxle-plugins"
+Source = "https://github.com/pyxle-dev/pyxle-plugins"
+Changelog = "https://github.com/pyxle-dev/pyxle-plugins/blob/main/packages/pyxle-auth/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
+# Hatchling ships every file under the package, so the bundled
+# migrations (pyxle_auth/migrations/*.sql) ride along in the wheel.
 packages = ["pyxle_auth"]
 
 [tool.pytest.ini_options]

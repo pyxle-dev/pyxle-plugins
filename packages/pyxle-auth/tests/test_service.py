@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import asyncio
+from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
+import pyxle_auth
 from pyxle_auth import (
     AccountExists,
     AuthError,
@@ -14,7 +16,9 @@ from pyxle_auth import (
     RateLimited,
     WeakPassword,
 )
-from pyxle_db import Database
+from pyxle_auth.errors import InvalidToken
+from pyxle_auth.models import _now_utc
+from pyxle_db import Database, connect
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +206,96 @@ async def test_revoke_all_logs_every_device_out(auth: AuthService) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Session listing / per-session revocation
+
+
+async def test_list_sessions_newest_first_with_current_flag(
+    auth: AuthService,
+) -> None:
+    user, c1 = await auth.sign_up(
+        email="a@b.com", password="passw0rd-1234", ip="1.1.1.1", user_agent="laptop"
+    )
+    _, c2 = await auth.sign_in(
+        email="a@b.com", password="passw0rd-1234", ip="2.2.2.2", user_agent="phone"
+    )
+
+    sessions = await auth.list_sessions(
+        user_id=user.id, current_cookie_value=c2.value
+    )
+    assert len(sessions) == 2
+    # Newest first; the second device is the caller's current session.
+    assert sessions[0].created_at >= sessions[1].created_at
+    assert [s.current for s in sessions].count(True) == 1
+    current = next(s for s in sessions if s.current)
+    assert current.user_agent == "phone"
+    assert current.ip == "2.2.2.2"
+    # ids are token hashes, never the raw cookie value.
+    assert all(s.id not in (c1.value, c2.value) for s in sessions)
+
+
+async def test_list_sessions_without_current_cookie(auth: AuthService) -> None:
+    user, _ = await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    sessions = await auth.list_sessions(user_id=user.id)
+    assert len(sessions) == 1
+    assert sessions[0].current is False
+
+
+async def test_list_sessions_excludes_expired_and_overaged(
+    auth: AuthService, db: Database, settings: AuthSettings
+) -> None:
+    user, _ = await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    now = _now_utc()
+    # An expired session and one past the absolute age cap, inserted
+    # directly so the test doesn't depend on wall-clock sleeping.
+    await db.execute(
+        "INSERT INTO sessions (token_sha256, user_id, created_at, expires_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("deadbeef" * 8, user.id, now - timedelta(days=2), now - timedelta(days=1)),
+    )
+    overaged_created = now - timedelta(
+        seconds=settings.session_absolute_max_seconds + 3600
+    )
+    await db.execute(
+        "INSERT INTO sessions (token_sha256, user_id, created_at, expires_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("cafef00d" * 8, user.id, overaged_created, now + timedelta(days=1)),
+    )
+
+    sessions = await auth.list_sessions(user_id=user.id)
+    assert len(sessions) == 1  # only the live sign-up session
+
+
+async def test_revoke_session_kills_that_device(auth: AuthService) -> None:
+    user, c1 = await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    _, c2 = await auth.sign_in(email="a@b.com", password="passw0rd-1234")
+
+    sessions = await auth.list_sessions(
+        user_id=user.id, current_cookie_value=c2.value
+    )
+    other = next(s for s in sessions if not s.current)
+
+    assert await auth.revoke_session(user_id=user.id, session_id=other.id) is True
+    assert await auth.resolve_session(cookie_value=c1.value) is None
+    assert await auth.resolve_session(cookie_value=c2.value) is not None
+    # Idempotent: a second revoke finds nothing.
+    assert await auth.revoke_session(user_id=user.id, session_id=other.id) is False
+
+
+async def test_revoke_session_is_scoped_to_owner(auth: AuthService) -> None:
+    """User A cannot revoke user B's session, even with a leaked id."""
+    user_a, _ = await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    user_b, cookie_b = await auth.sign_up(email="b@b.com", password="passw0rd-1234")
+
+    [session_b] = await auth.list_sessions(user_id=user_b.id)
+    assert (
+        await auth.revoke_session(user_id=user_a.id, session_id=session_b.id)
+        is False
+    )
+    # B's session is untouched.
+    assert await auth.resolve_session(cookie_value=cookie_b.value) is not None
+
+
+# ---------------------------------------------------------------------------
 # Password change
 
 
@@ -240,7 +334,169 @@ async def test_change_password_revokes_sessions(auth: AuthService) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Email verification gate
+# Password reset
+
+
+async def test_password_reset_roundtrip(auth: AuthService) -> None:
+    await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+
+    result = await auth.request_password_reset(email="A@B.com ", ip="1.1.1.1")
+    assert result is not None
+    user, raw_token = result
+    assert user.email == "a@b.com"
+    assert raw_token
+
+    reset_user = await auth.reset_password(
+        raw_token=raw_token, new_password="brand-new-password-1"
+    )
+    assert reset_user.id == user.id
+
+    with pytest.raises(InvalidCredentials):
+        await auth.sign_in(email="a@b.com", password="passw0rd-1234")
+    await auth.sign_in(email="a@b.com", password="brand-new-password-1")
+
+
+async def test_password_reset_unknown_email_returns_none(
+    auth: AuthService,
+) -> None:
+    # No exception, no token, nothing to distinguish from the hit path.
+    assert await auth.request_password_reset(email="nobody@b.com") is None
+
+
+async def test_password_reset_rate_limited_per_email(auth: AuthService) -> None:
+    await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    for _ in range(3):
+        assert await auth.request_password_reset(email="a@b.com") is not None
+    with pytest.raises(RateLimited):
+        await auth.request_password_reset(email="a@b.com")
+
+
+async def test_password_reset_rate_limits_unknown_emails_identically(
+    auth: AuthService,
+) -> None:
+    """The limiter must not reveal account existence either: unknown
+    emails hit the same 3/hour wall."""
+    for _ in range(3):
+        assert await auth.request_password_reset(email="ghost@b.com") is None
+    with pytest.raises(RateLimited):
+        await auth.request_password_reset(email="ghost@b.com")
+
+
+async def test_password_reset_token_is_single_use(auth: AuthService) -> None:
+    await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    result = await auth.request_password_reset(email="a@b.com")
+    assert result is not None
+    _, raw_token = result
+
+    await auth.reset_password(raw_token=raw_token, new_password="new-password-111")
+    with pytest.raises(InvalidToken):
+        await auth.reset_password(
+            raw_token=raw_token, new_password="new-password-222"
+        )
+
+
+async def test_password_reset_rejects_garbage_token(auth: AuthService) -> None:
+    with pytest.raises(InvalidToken):
+        await auth.reset_password(
+            raw_token="not-a-real-token", new_password="new-password-111"
+        )
+
+
+async def test_requesting_again_invalidates_previous_reset_link(
+    auth: AuthService,
+) -> None:
+    await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    first = await auth.request_password_reset(email="a@b.com")
+    second = await auth.request_password_reset(email="a@b.com")
+    assert first is not None and second is not None
+
+    with pytest.raises(InvalidToken):
+        await auth.reset_password(
+            raw_token=first[1], new_password="new-password-111"
+        )
+    await auth.reset_password(raw_token=second[1], new_password="new-password-111")
+
+
+async def test_password_reset_revokes_all_sessions(auth: AuthService) -> None:
+    _, c1 = await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    _, c2 = await auth.sign_in(email="a@b.com", password="passw0rd-1234")
+
+    result = await auth.request_password_reset(email="a@b.com")
+    assert result is not None
+    await auth.reset_password(
+        raw_token=result[1], new_password="new-password-111"
+    )
+
+    assert await auth.resolve_session(cookie_value=c1.value) is None
+    assert await auth.resolve_session(cookie_value=c2.value) is None
+
+
+async def test_weak_password_does_not_burn_reset_token(
+    auth: AuthService,
+) -> None:
+    """Policy runs before consumption, so the user can fix their
+    password and submit the same link again."""
+    await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    result = await auth.request_password_reset(email="a@b.com")
+    assert result is not None
+    _, raw_token = result
+
+    with pytest.raises(WeakPassword):
+        await auth.reset_password(raw_token=raw_token, new_password="short")
+    # Token still valid.
+    await auth.reset_password(raw_token=raw_token, new_password="long-enough-pw-1")
+
+
+# ---------------------------------------------------------------------------
+# Email verification
+
+
+async def test_email_verification_roundtrip(auth: AuthService) -> None:
+    user, _ = await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    assert user.email_verified_at is None
+
+    raw_token = await auth.request_email_verification(user_id=user.id)
+    verified = await auth.confirm_email(raw_token=raw_token)
+    assert verified.id == user.id
+    assert verified.email_verified_at is not None
+
+
+async def test_email_verification_token_is_single_use(auth: AuthService) -> None:
+    user, _ = await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+    raw_token = await auth.request_email_verification(user_id=user.id)
+    await auth.confirm_email(raw_token=raw_token)
+    with pytest.raises(InvalidToken):
+        await auth.confirm_email(raw_token=raw_token)
+
+
+async def test_email_verification_rejects_garbage_token(
+    auth: AuthService,
+) -> None:
+    with pytest.raises(InvalidToken):
+        await auth.confirm_email(raw_token="nope")
+
+
+async def test_email_verification_for_unknown_user_raises(
+    auth: AuthService,
+) -> None:
+    with pytest.raises(AuthError):
+        await auth.request_email_verification(user_id="missing")
+
+
+async def test_tokens_are_purpose_scoped(auth: AuthService) -> None:
+    """A verification token can never reset a password, and vice versa."""
+    user, _ = await auth.sign_up(email="a@b.com", password="passw0rd-1234")
+
+    verify_token = await auth.request_email_verification(user_id=user.id)
+    with pytest.raises(InvalidToken):
+        await auth.reset_password(
+            raw_token=verify_token, new_password="new-password-111"
+        )
+
+    result = await auth.request_password_reset(email="a@b.com")
+    assert result is not None
+    with pytest.raises(InvalidToken):
+        await auth.confirm_email(raw_token=result[1])
 
 
 async def test_email_verification_gate(db: Database) -> None:
@@ -261,7 +517,49 @@ async def test_email_verification_gate(db: Database) -> None:
 
     user = await auth.get_user_by_email(email="a@b.com")
     assert user is not None
-    await auth.mark_email_verified(user_id=user.id)
+    raw_token = await auth.request_email_verification(user_id=user.id)
+    await auth.confirm_email(raw_token=raw_token)
 
     _, cookie = await auth.sign_in(email="a@b.com", password="passw0rd-1234")
     assert cookie.value
+
+
+# ---------------------------------------------------------------------------
+# Shipped migration file
+
+
+async def test_migration_file_bootstraps_full_schema(
+    tmp_path: Path, settings: AuthSettings
+) -> None:
+    """The shipped migrations file alone supports every service flow —
+    no ensure_schema() call anywhere."""
+    migrations_dir = Path(pyxle_auth.__file__).parent / "migrations"
+    db = await connect(tmp_path / "migrated.db", migrations_dir=migrations_dir)
+    try:
+        auth = AuthService(db, settings)
+
+        user, cookie = await auth.sign_up(
+            email="a@b.com", password="passw0rd-1234", ip="1.1.1.1"
+        )
+        resolved = await auth.resolve_session(cookie_value=cookie.value)
+        assert resolved is not None and resolved.id == user.id
+
+        result = await auth.request_password_reset(email="a@b.com")
+        assert result is not None
+        await auth.reset_password(
+            raw_token=result[1], new_password="new-password-111"
+        )
+
+        # Tables owned by the other services exist with the agreed shape.
+        assert await db.fetchall(
+            "SELECT id, token_sha256, user_id, name, scopes, created_at, "
+            "expires_at, last_used_at, revoked_at FROM api_tokens"
+        ) == []
+        assert await db.fetchall(
+            "SELECT name, permissions, created_at FROM roles"
+        ) == []
+        assert await db.fetchall(
+            "SELECT user_id, role_name, granted_at FROM user_roles"
+        ) == []
+    finally:
+        await db.aclose()

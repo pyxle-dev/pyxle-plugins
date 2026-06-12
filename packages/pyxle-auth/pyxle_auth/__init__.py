@@ -1,32 +1,60 @@
-"""pyxle-auth — email+password session authentication for Pyxle apps.
+"""pyxle-auth — Django-grade authentication for Pyxle apps.
 
 Public surface:
 
-* :class:`AuthService` — high-level API: sign up, sign in, resolve
-  session, sign out.
+* :class:`AuthService` — sign up, sign in, resolve session, sign out,
+  password change/reset, email verification.
 * :class:`AuthSettings` — knobs (password cost, session lifetime,
-  rate-limit buckets, cookie attributes). Load from env via
-  :meth:`AuthSettings.from_env`.
-* :class:`User`, :class:`Session` — returned dataclasses.
+  token TTLs, rate-limit buckets, cookie attributes). Load from env
+  via :meth:`AuthSettings.from_env`.
+* :class:`User`, :class:`Session`, :class:`SessionInfo` — returned
+  dataclasses.
 * :class:`SessionCookie` — helper carrying the cookie name/value plus
   recommended attributes; expand with :meth:`SessionCookie.kwargs`.
+* :class:`TokenService` / :class:`TokenClaim` — single-use,
+  purpose-scoped tokens (password reset, email verification, invites).
+* :class:`ApiTokenService` / :class:`ApiToken` — long-lived, scoped
+  ``pyxle_pat_`` personal access tokens.
+* :class:`RoleService` — roles, permissions, grants (RBAC).
+* Guards — :func:`current_user`, :func:`require_user_page`,
+  :func:`require_user_action`, :func:`require_permission_page`,
+  :func:`require_permission_action`, :func:`bearer_token`.
 * Errors: :class:`AuthError`, :class:`InvalidCredentials`,
-  :class:`RateLimited`, :class:`AccountExists`, :class:`EmailNotVerified`.
+  :class:`RateLimited`, :class:`AccountExists`, :class:`WeakPassword`,
+  :class:`EmailNotVerified`, :class:`InvalidToken`,
+  :class:`RoleNotFound`, :class:`TokenLimitReached`.
 """
 
 from __future__ import annotations
 
+from pyxle_auth.api_tokens import (
+    TOKEN_PREFIX,
+    ApiToken,
+    ApiTokenService,
+    TokenLimitReached,
+)
 from pyxle_auth.errors import (
     AccountExists,
     AuthError,
     EmailNotVerified,
     InvalidCredentials,
+    InvalidToken,
     RateLimited,
     WeakPassword,
 )
-from pyxle_auth.models import Session, SessionCookie, User
+from pyxle_auth.guards import (
+    bearer_token,
+    current_user,
+    require_permission_action,
+    require_permission_page,
+    require_user_action,
+    require_user_page,
+)
+from pyxle_auth.models import Session, SessionCookie, SessionInfo, User
+from pyxle_auth.rbac import RoleNotFound, RoleService
 from pyxle_auth.service import AuthService
 from pyxle_auth.settings import AuthSettings
+from pyxle_auth.tokens import TokenClaim, TokenService
 
 
 def get_auth_service() -> AuthService:
@@ -72,19 +100,35 @@ def get_auth_settings() -> AuthSettings:
 
 
 __all__ = [
+    "TOKEN_PREFIX",
+    "AccountExists",
+    "ApiToken",
+    "ApiTokenService",
     "AuthError",
     "AuthService",
     "AuthSettings",
-    "AccountExists",
     "EmailNotVerified",
     "InvalidCredentials",
+    "InvalidToken",
     "RateLimited",
+    "RoleNotFound",
+    "RoleService",
     "Session",
     "SessionCookie",
+    "SessionInfo",
+    "TokenClaim",
+    "TokenLimitReached",
+    "TokenService",
     "User",
     "WeakPassword",
+    "bearer_token",
+    "current_user",
     "get_auth_service",
     "get_auth_settings",
+    "require_permission_action",
+    "require_permission_page",
+    "require_user_action",
+    "require_user_page",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

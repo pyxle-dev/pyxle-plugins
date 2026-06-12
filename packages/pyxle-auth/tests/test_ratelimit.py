@@ -47,6 +47,26 @@ async def test_reset_clears_buckets(limiter: RateLimiter) -> None:
     assert r.allowed is True
 
 
+async def test_reset_treats_like_wildcards_literally(
+    limiter: RateLimiter, db: Database
+) -> None:
+    """An identifier containing ``_`` or ``%`` (legal in email local
+    parts) must only ever reset its own buckets — the LIKE pattern is
+    escaped, so ``a_b@x.com`` cannot clear ``axb@x.com``'s counter."""
+    for _ in range(3):
+        await limiter.check_and_increment(
+            scope="test", identifier="axb@x.com", limit=3
+        )
+    await limiter.check_and_increment(scope="test", identifier="a_b@x.com", limit=3)
+
+    await limiter.reset(scope="test", identifier="a_b@x.com")
+
+    rows = await db.fetchall("SELECT bucket_key FROM ratelimit_buckets")
+    keys = [r["bucket_key"] for r in rows]
+    assert len(keys) == 1
+    assert keys[0].startswith("test:axb@x.com:")
+
+
 async def test_sweep_only_removes_expired(
     db: Database, limiter: RateLimiter
 ) -> None:
@@ -57,15 +77,15 @@ async def test_sweep_only_removes_expired(
     one with a future one.
     """
     async with db.transaction() as tx:
-        tx.execute(
+        await tx.execute(
             """
-            INSERT INTO ratelimit_buckets (key, count, expires_at)
+            INSERT INTO ratelimit_buckets (bucket_key, count, expires_at)
             VALUES ('t:expired:0', 3, 1)
             """
         )
-        tx.execute(
+        await tx.execute(
             """
-            INSERT INTO ratelimit_buckets (key, count, expires_at)
+            INSERT INTO ratelimit_buckets (bucket_key, count, expires_at)
             VALUES ('t:fresh:0', 1, 9999999999)
             """
         )
@@ -73,5 +93,7 @@ async def test_sweep_only_removes_expired(
     deleted = await limiter.sweep_expired()
     assert deleted == 1
 
-    rows = await db.fetchall("SELECT key FROM ratelimit_buckets ORDER BY key")
-    assert [r["key"] for r in rows] == ["t:fresh:0"]
+    rows = await db.fetchall(
+        "SELECT bucket_key FROM ratelimit_buckets ORDER BY bucket_key"
+    )
+    assert [r["bucket_key"] for r in rows] == ["t:fresh:0"]

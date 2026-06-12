@@ -4,12 +4,17 @@
 with. It owns:
 
 * password hashing (argon2id)
-* session issuance, resolution, extension, revocation
+* session issuance, resolution, extension, listing, revocation
 * per-identifier rate limiting
+* password-reset and email-verification flows, built on the single-use
+  tokens in :mod:`pyxle_auth.tokens` (the library never sends email —
+  the raw token is returned for the app's mailer, Django-style)
 
 The service owns its own schema: :meth:`ensure_schema` creates the
-``users`` and ``sessions`` tables if they don't exist. Apps that run
-their own migrations file should apply the equivalent SQL there and
+``users`` and ``sessions`` tables (plus the rate-limit and auth-token
+tables its collaborators own) if they don't exist. Apps that run their
+own migrations should apply
+``pyxle_auth/migrations/0001-pyxle-auth-core.sql`` there instead and
 skip calling :meth:`ensure_schema` at runtime.
 
 Security choices worth calling out:
@@ -24,36 +29,67 @@ Security choices worth calling out:
   path so timing doesn't leak account existence. The "user doesn't
   exist" branch still runs a single dummy ``verify`` against a
   pre-computed hash to equalise wall-clock time.
+* :meth:`request_password_reset` is equally enumeration-proof: unknown
+  emails return ``None`` after burning the same token-generation cost
+  the hit path pays, and the rate limiter counts both cases.
 * Emails are normalised (lowercased, stripped) on both write and read.
   Case differences never create two accounts.
+
+SQL is written once in canonical qmark style and stays portable across
+pyxle-db's SQLite/PostgreSQL/MySQL backends: positional parameters only,
+explicit values instead of column DEFAULTs, no upsert dialects.
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import secrets
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerifyMismatchError
 
-from pyxle_db import Database, IntegrityError, NotFoundError
+from pyxle_db import DatabaseLike, IntegrityError
 
+from pyxle_auth._ddl import ensure_index, timestamp_type
 from pyxle_auth.errors import (
     AccountExists,
     AuthError,
     EmailNotVerified,
     InvalidCredentials,
+    InvalidToken,
     RateLimited,
     WeakPassword,
 )
-from pyxle_auth.models import Session, SessionCookie, User, _now_utc
+from pyxle_auth.models import SessionCookie, SessionInfo, User, _now_utc
 from pyxle_auth.ratelimit import RateLimiter
 from pyxle_auth.settings import AuthSettings
+from pyxle_auth.tokens import TokenService
+
+
+# ---------------------------------------------------------------------------
+# Constants
+
+_DEFAULT_PLAN = "free"
+
+_PURPOSE_PASSWORD_RESET = "password_reset"
+_PURPOSE_EMAIL_VERIFY = "email_verify"
+
+# Stand-in user id for the password-reset miss path, so an unknown email
+# does the same committed token write a real one does (timing parity). The
+# NUL prefix can never collide with a real uuid4-hex user id.
+_RESET_SENTINEL_USER_ID = "\x00pwreset-sentinel"
+
+# Hourly cap on password-reset requests, per email and (when given) per
+# IP. Deliberately tighter than sign-in: each allowed request emails a
+# live account-takeover link.
+_PASSWORD_RESET_PER_HOUR = 3
+
+# Fallbacks for the matching AuthSettings fields, read via getattr so
+# this module works against settings objects predating the fields.
+_DEFAULT_PASSWORD_RESET_TTL = 1800
+_DEFAULT_EMAIL_VERIFY_TTL = 86400
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +114,7 @@ def _normalise_email(raw: str) -> str:
 
 
 def _hash_token(raw: str) -> str:
-    """SHA-256 hex digest. Used for session tokens and email verify tokens."""
+    """SHA-256 hex digest — how session tokens are stored at rest."""
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -92,13 +128,14 @@ def _generate_user_id() -> str:
 
 
 class AuthService:
-    """Owns password hashing, session lifecycle, and rate limiting.
+    """Owns password hashing, session lifecycle, rate limiting, and the
+    password-reset / email-verification token flows.
 
     Thread-unsafe to share a single :class:`PasswordHasher` across
     processes is not a concern — argon2-cffi's hasher is stateless.
     """
 
-    def __init__(self, db: Database, settings: AuthSettings) -> None:
+    def __init__(self, db: DatabaseLike, settings: AuthSettings) -> None:
         self._db = db
         self._settings = settings
         self._hasher = PasswordHasher(
@@ -107,50 +144,62 @@ class AuthService:
             parallelism=settings.argon_parallelism,
         )
         self._ratelimiter = RateLimiter(db)
+        # Public on purpose: apps with bespoke flows (invites, magic
+        # links) issue their own purposes on the same token table.
+        self.tokens: TokenService = TokenService(db)
         # A pre-computed hash used to keep sign-in wall-clock time
         # constant when the email doesn't exist. Recomputed once per
         # process; value itself doesn't matter.
         self._timing_hash = self._hasher.hash("0" * 32)
+
+    @property
+    def settings(self) -> AuthSettings:
+        """The resolved settings — read by :mod:`pyxle_auth.guards` for
+        the cookie name, and handy for apps building responses by hand."""
+        return self._settings
 
     # ---- schema ----------------------------------------------------------------
 
     async def ensure_schema(self) -> None:
         """Create our tables if they don't exist.
 
-        Apps preferring to own migrations can skip this.
+        Apps preferring to own migrations can skip this and apply
+        ``pyxle_auth/migrations/0001-pyxle-auth-core.sql`` instead.
         """
         await self._ratelimiter.ensure_schema()
+        await self.tokens.ensure_schema()
+        ts = timestamp_type(self._db.dialect.name)
         async with self._db.transaction() as tx:
-            tx.execute(
+            await tx.execute(
                 """
                 CREATE TABLE IF NOT EXISTS users (
-                    id                TEXT PRIMARY KEY,
-                    email             TEXT UNIQUE NOT NULL,
+                    id                VARCHAR(64) PRIMARY KEY,
+                    email             VARCHAR(255) NOT NULL UNIQUE,
                     password_hash     TEXT NOT NULL,
-                    email_verified_at TIMESTAMP,
-                    created_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    plan              TEXT NOT NULL DEFAULT 'free'
+                    email_verified_at {ts},
+                    created_at        {ts} NOT NULL,
+                    plan              TEXT NOT NULL
                 )
-                """
+                """.format(ts=ts)
             )
-            tx.execute(
+            await tx.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sessions (
-                    token_sha256 TEXT PRIMARY KEY,
-                    user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    expires_at   TIMESTAMP NOT NULL,
+                    token_sha256 VARCHAR(64) PRIMARY KEY,
+                    user_id      VARCHAR(64) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at   {ts} NOT NULL,
+                    expires_at   {ts} NOT NULL,
                     user_agent   TEXT,
                     ip           TEXT
                 )
-                """
+                """.format(ts=ts)
             )
-            tx.execute(
-                "CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id)"
-            )
-            tx.execute(
-                "CREATE INDEX IF NOT EXISTS sessions_expires ON sessions(expires_at)"
-            )
+        await ensure_index(
+            self._db, name="sessions_user", table="sessions", columns="user_id"
+        )
+        await ensure_index(
+            self._db, name="sessions_expires", table="sessions", columns="expires_at"
+        )
 
     # ---- sign-up ---------------------------------------------------------------
 
@@ -185,14 +234,13 @@ class AuthService:
         user_id = _generate_user_id()
 
         try:
-            async with self._db.transaction() as tx:
-                tx.execute(
-                    """
-                    INSERT INTO users (id, email, password_hash)
-                    VALUES (?, ?, ?)
-                    """,
-                    (user_id, email_n, password_hash),
-                )
+            await self._db.execute(
+                """
+                INSERT INTO users (id, email, password_hash, created_at, plan)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (user_id, email_n, password_hash, _now_utc(), _DEFAULT_PLAN),
+            )
         except IntegrityError:
             # UNIQUE(email)
             raise AccountExists() from None
@@ -223,19 +271,32 @@ class AuthService:
         """
         email_n = _normalise_email(email)
 
-        for scope, identifier in (
-            ("auth:sign-in:ip", ip),
-            ("auth:sign-in:email", email_n),
-        ):
-            if identifier is None:
-                continue
-            rl = await self._ratelimiter.check_and_increment(
-                scope=scope,
-                identifier=identifier,
+        # Reject over-length passwords BEFORE any argon2 work. A password
+        # longer than the policy max can never match a stored hash (sign_up
+        # enforces the same cap), so this leaks nothing — but it stops an
+        # attacker amplifying CPU by feeding multi-megabyte passwords into
+        # the verifier (the dummy-verify path below would hash them too).
+        if len(password) > self._settings.password_max_length:
+            raise InvalidCredentials()
+
+        # The IP bucket throttles a single abusive source pre-verify. The
+        # email bucket is checked too, but a CORRECT password always wins
+        # (below), so flooding a victim's email with wrong guesses can never
+        # lock the legitimate owner out of their own account.
+        if ip is not None:
+            ip_rl = await self._ratelimiter.check_and_increment(
+                scope="auth:sign-in:ip",
+                identifier=ip,
                 limit=self._settings.rate_limit_sign_in_per_hour,
             )
-            if not rl.allowed:
-                raise RateLimited(rl.retry_after_seconds)
+            if not ip_rl.allowed:
+                raise RateLimited(ip_rl.retry_after_seconds)
+        email_rl = await self._ratelimiter.check_and_increment(
+            scope="auth:sign-in:email",
+            identifier=email_n,
+            limit=self._settings.rate_limit_sign_in_per_hour,
+        )
+        email_limited = not email_rl.allowed
 
         row = await self._db.fetchone(
             "SELECT id, password_hash, email_verified_at FROM users WHERE email = ?",
@@ -248,12 +309,23 @@ class AuthService:
                 self._hasher.verify(self._timing_hash, password)
             except VerifyMismatchError:
                 pass
+            # No real account to protect; an exhausted email bucket may
+            # surface as RateLimited, otherwise it's a normal bad login.
+            if email_limited:
+                raise RateLimited(email_rl.retry_after_seconds)
             raise InvalidCredentials()
 
         try:
             self._hasher.verify(row["password_hash"], password)
         except (VerifyMismatchError, InvalidHashError):
+            # Wrong password: NOW the email bucket may block, throttling a
+            # distributed guessing campaign against this one account.
+            if email_limited:
+                raise RateLimited(email_rl.retry_after_seconds) from None
             raise InvalidCredentials() from None
+
+        # Correct password from here on — the email bucket is deliberately
+        # NOT consulted, so the owner is never locked out by others' failures.
 
         # Opportunistic rehash: if our argon2 params have moved on since
         # this password was hashed, write a refreshed hash in the
@@ -315,8 +387,8 @@ class AuthService:
         if row is None:
             return None
 
-        expires_at = _coerce_dt(row["expires_at"])
-        created_at = _coerce_dt(row["created_at"])
+        expires_at = _aware(row["expires_at"])
+        created_at = _aware(row["created_at"])
         if expires_at < now:
             # Lazy cleanup of the expired row.
             await self._db.execute(
@@ -354,11 +426,10 @@ class AuthService:
 
     async def sign_out(self, *, cookie_value: str) -> SessionCookie:
         """Revoke the session and return a cookie that clears the browser's."""
-        token_hash = _hash_token(cookie_value) if cookie_value else None
-        if token_hash is not None:
+        if cookie_value:
             await self._db.execute(
                 "DELETE FROM sessions WHERE token_sha256 = ?",
-                (token_hash,),
+                (_hash_token(cookie_value),),
             )
         return self._delete_cookie()
 
@@ -368,12 +439,67 @@ class AuthService:
         Useful after a password change: the user's other devices should
         lose their sessions.
         """
-        async with self._db.transaction() as tx:
-            cur = tx.execute(
-                "DELETE FROM sessions WHERE user_id = ?",
-                (user_id,),
+        return await self._db.execute(
+            "DELETE FROM sessions WHERE user_id = ?",
+            (user_id,),
+        )
+
+    # ---- session management ------------------------------------------------------
+
+    async def list_sessions(
+        self,
+        *,
+        user_id: str,
+        current_cookie_value: str | None = None,
+    ) -> list[SessionInfo]:
+        """Active sessions for a user's "devices" screen, newest first.
+
+        Sessions :meth:`resolve_session` would refuse — expired, or past
+        the absolute age cap — are excluded. Pass the caller's own
+        session cookie as ``current_cookie_value`` to have their row
+        flagged ``current=True``.
+        """
+        now = _now_utc()
+        current_hash = (
+            _hash_token(current_cookie_value) if current_cookie_value else None
+        )
+        rows = await self._db.fetchall(
+            """
+            SELECT token_sha256, created_at, expires_at, user_agent, ip
+            FROM sessions
+            WHERE user_id = ? AND expires_at > ?
+            ORDER BY created_at DESC
+            """,
+            (user_id, now),
+        )
+        absolute_max = timedelta(
+            seconds=self._settings.session_absolute_max_seconds
+        )
+        return [
+            SessionInfo(
+                id=row["token_sha256"],
+                created_at=_aware(row["created_at"]),
+                expires_at=_aware(row["expires_at"]),
+                user_agent=row["user_agent"],
+                ip=row["ip"],
+                current=row["token_sha256"] == current_hash,
             )
-            return cur.rowcount
+            for row in rows
+            if _aware(row["created_at"]) + absolute_max >= now
+        ]
+
+    async def revoke_session(self, *, user_id: str, session_id: str) -> bool:
+        """Revoke one session by its :attr:`SessionInfo.id`.
+
+        Scoped by owner — a user can never revoke another user's
+        session, even with a leaked id. Idempotent: returns ``False``
+        when nothing matched.
+        """
+        affected = await self._db.execute(
+            "DELETE FROM sessions WHERE token_sha256 = ? AND user_id = ?",
+            (session_id, user_id),
+        )
+        return affected > 0
 
     # ---- password change -------------------------------------------------------
 
@@ -397,13 +523,175 @@ class AuthService:
             raise InvalidCredentials() from None
         new_hash = self._hasher.hash(new_password)
         async with self._db.transaction() as tx:
-            tx.execute(
+            await tx.execute(
                 "UPDATE users SET password_hash = ? WHERE id = ?",
                 (new_hash, user_id),
             )
             # Revoke every session (including the caller's) — they'll
             # need to sign in again with the new password.
-            tx.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+            await tx.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+
+    # ---- password reset ----------------------------------------------------------
+
+    async def request_password_reset(
+        self,
+        *,
+        email: str,
+        ip: str | None = None,
+    ) -> tuple[User, str] | None:
+        """Begin a password reset. Returns ``(user, raw_token)`` or ``None``.
+
+        The raw token goes to the app's mailer (we never send email);
+        the user completes the flow via :meth:`reset_password`. Token
+        TTL comes from ``AuthSettings.password_reset_ttl_seconds``
+        (default 30 minutes), and requesting again invalidates earlier
+        unused reset tokens.
+
+        ``None`` means no account matches — render the exact same
+        "check your inbox" response in both cases so the endpoint can't
+        be used to probe for accounts. The miss path burns the same
+        token-generation cost the hit path pays, keeping response times
+        aligned, and the rate limiter counts both outcomes.
+
+        Raises :class:`RateLimited` past 3 requests/hour per email
+        (scope ``pwreset``) or — when ``ip`` is given — per IP (scope
+        ``pwreset:ip``), mirroring sign-in's dual-bucket defence.
+        """
+        email_n = _normalise_email(email)
+
+        for scope, identifier in (("pwreset", email_n), ("pwreset:ip", ip)):
+            if identifier is None:
+                continue
+            rl = await self._ratelimiter.check_and_increment(
+                scope=scope,
+                identifier=identifier,
+                limit=getattr(
+                    self._settings,
+                    "rate_limit_password_reset_per_hour",
+                    _PASSWORD_RESET_PER_HOUR,
+                ),
+            )
+            if not rl.allowed:
+                raise RateLimited(rl.retry_after_seconds)
+
+        ttl = getattr(
+            self._settings, "password_reset_ttl_seconds", _DEFAULT_PASSWORD_RESET_TTL
+        )
+        row = await self._db.fetchone(
+            "SELECT id FROM users WHERE email = ?", (email_n,)
+        )
+        if row is None:
+            # Unknown email: perform the SAME committed write the hit path
+            # pays — an SELECT + a token UPDATE+INSERT transaction — against
+            # a sentinel user id, so response timing can't reveal account
+            # existence. ``revoke_existing`` means every miss reuses one
+            # sentinel row (it never accumulates), and the row references no
+            # real user so a consumed sentinel token resolves to nobody.
+            await self._load_user_by_id(_RESET_SENTINEL_USER_ID)
+            await self.tokens.issue(
+                purpose=_PURPOSE_PASSWORD_RESET,
+                user_id=_RESET_SENTINEL_USER_ID,
+                ttl_seconds=ttl,
+            )
+            return None
+
+        user = await self._load_user_by_id(row["id"])
+        assert user is not None
+        raw_token = await self.tokens.issue(
+            purpose=_PURPOSE_PASSWORD_RESET,
+            user_id=user.id,
+            ttl_seconds=ttl,
+        )
+        return user, raw_token
+
+    async def reset_password(self, *, raw_token: str, new_password: str) -> User:
+        """Complete a password reset: burn the token, set the new hash,
+        and revoke every session (whoever triggered the reset usually
+        suspects the old password is in someone else's hands).
+
+        The policy check runs *before* token consumption so a weak
+        password doesn't waste the single-use token — the user can fix
+        their password and submit the same link again.
+
+        Raises :class:`InvalidToken` for an unknown, expired, used, or
+        wrong-purpose token, and :class:`WeakPassword` on policy failure.
+        """
+        self._check_password_policy(new_password)
+        claim = await self.tokens.consume(
+            purpose=_PURPOSE_PASSWORD_RESET, raw_token=raw_token
+        )
+        if claim is None:
+            raise InvalidToken()
+
+        new_hash = self._hasher.hash(new_password)
+        async with self._db.transaction() as tx:
+            affected = await tx.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (new_hash, claim.user_id),
+            )
+            if affected == 0:
+                # The account vanished between issue and redeem.
+                raise InvalidToken()
+            await tx.execute(
+                "DELETE FROM sessions WHERE user_id = ?", (claim.user_id,)
+            )
+
+        user = await self._load_user_by_id(claim.user_id)
+        assert user is not None  # the UPDATE above proved the row exists
+        return user
+
+    # ---- email verification ----------------------------------------------------
+
+    async def request_email_verification(self, *, user_id: str) -> str:
+        """Mint an email-verification token for the app's mailer.
+
+        TTL comes from ``AuthSettings.email_verify_ttl_seconds``
+        (default 24 hours). The user completes the flow via
+        :meth:`confirm_email`. Raises :class:`AuthError` for an unknown
+        ``user_id`` — callers hold one from a live session, so a miss is
+        a programming error, not an enumeration channel.
+        """
+        user = await self._load_user_by_id(user_id)
+        if user is None:
+            raise AuthError("No such user.")
+        ttl = getattr(
+            self._settings, "email_verify_ttl_seconds", _DEFAULT_EMAIL_VERIFY_TTL
+        )
+        return await self.tokens.issue(
+            purpose=_PURPOSE_EMAIL_VERIFY,
+            user_id=user_id,
+            ttl_seconds=ttl,
+        )
+
+    async def confirm_email(self, *, raw_token: str) -> User:
+        """Burn an email-verification token and stamp the user verified.
+
+        Raises :class:`InvalidToken` for an unknown, expired, used, or
+        wrong-purpose token.
+        """
+        claim = await self.tokens.consume(
+            purpose=_PURPOSE_EMAIL_VERIFY, raw_token=raw_token
+        )
+        if claim is None:
+            raise InvalidToken()
+        await self.mark_email_verified(user_id=claim.user_id)
+        user = await self._load_user_by_id(claim.user_id)
+        if user is None:
+            # The account vanished between issue and redeem.
+            raise InvalidToken()
+        return user
+
+    async def mark_email_verified(self, *, user_id: str) -> None:
+        """Stamp ``email_verified_at`` to now.
+
+        :meth:`confirm_email` calls this for the token flow; it stays
+        public for apps verifying through other channels (OAuth-linked
+        addresses, admin override).
+        """
+        await self._db.execute(
+            "UPDATE users SET email_verified_at = ? WHERE id = ?",
+            (_now_utc(), user_id),
+        )
 
     # ---- introspection ---------------------------------------------------------
 
@@ -418,19 +706,6 @@ class AuthService:
         if row is None:
             return None
         return await self._load_user_by_id(row["id"])
-
-    # ---- email verification ----------------------------------------------------
-
-    async def mark_email_verified(self, *, user_id: str) -> None:
-        """Stamp ``email_verified_at`` to now.
-
-        Email flows (token issuance, send, confirm) are the host app's
-        responsibility; we only expose the DB mutation here.
-        """
-        await self._db.execute(
-            "UPDATE users SET email_verified_at = ? WHERE id = ?",
-            (_now_utc(), user_id),
-        )
 
     # ---- helpers ---------------------------------------------------------------
 
@@ -455,8 +730,8 @@ class AuthService:
         return User(
             id=row["id"],
             email=row["email"],
-            email_verified_at=_coerce_dt_nullable(row["email_verified_at"]),
-            created_at=_coerce_dt(row["created_at"]),
+            email_verified_at=_aware_or_none(row["email_verified_at"]),
+            created_at=_aware(row["created_at"]),
             plan=row["plan"],
         )
 
@@ -505,29 +780,18 @@ class AuthService:
 
 
 # ---------------------------------------------------------------------------
-# SQLite returns TIMESTAMP columns sometimes as ``str`` and sometimes as
-# ``datetime`` depending on how the row was inserted. Normalise.
+# pyxle-db backends return TIMESTAMP columns as timezone-aware UTC
+# datetimes (backend contract rule 4); tolerate naive values as UTC
+# anyway, matching the other pyxle-auth services.
 
 
-def _coerce_dt(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value
-    if isinstance(value, str):
-        # SQLite stores timestamps as ISO-8601 strings by default.
-        try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            # CURRENT_TIMESTAMP uses "YYYY-MM-DD HH:MM:SS"
-            parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
-    raise TypeError(f"Cannot coerce {type(value).__name__} to datetime")
+def _aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
-def _coerce_dt_nullable(value: Any) -> datetime | None:
+def _aware_or_none(value: datetime | None) -> datetime | None:
     if value is None:
         return None
-    return _coerce_dt(value)
+    return _aware(value)

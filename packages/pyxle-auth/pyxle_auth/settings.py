@@ -9,7 +9,8 @@ doesn't spend half a second hashing passwords per test.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
+from typing import Any, Mapping
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +46,14 @@ class AuthSettings:
         cookie_samesite: ``Lax`` (default), ``Strict``, or ``None``.
         cookie_domain: ``None`` to bind to the current host only, or a
             domain string to share across subdomains (e.g. ``.pyxle.app``).
+        password_reset_ttl_seconds: Lifetime of a password-reset token.
+            Short by design — the link sits in an inbox.
+        email_verify_ttl_seconds: Lifetime of an email-verification token.
+            Generous (a day) — verification is low-risk and users dawdle.
         rate_limit_sign_in_per_hour: Attempts per identifier+scope.
         rate_limit_sign_up_per_hour: Same, for sign-up.
+        rate_limit_password_reset_per_hour: Reset requests per identifier.
+            Low cap — each request emails the account owner.
         require_email_verified: If True, sign-in rejects unverified users.
     """
 
@@ -70,9 +77,14 @@ class AuthSettings:
     cookie_domain: str | None = None
     cookie_path: str = "/"
 
+    # Token lifetimes (password reset / email verification)
+    password_reset_ttl_seconds: int = 1800       # 30 minutes
+    email_verify_ttl_seconds: int = 86400        # 24 hours
+
     # Rate limits
     rate_limit_sign_in_per_hour: int = 10
     rate_limit_sign_up_per_hour: int = 5
+    rate_limit_password_reset_per_hour: int = 3
 
     # Email verification
     require_email_verified: bool = False
@@ -99,12 +111,45 @@ class AuthSettings:
                 "cookie_secure must be True in strict mode. "
                 "Set strict=False for tests."
             )
+        if self.password_reset_ttl_seconds <= 0:
+            raise ValueError("password_reset_ttl_seconds must be positive")
+        if self.email_verify_ttl_seconds <= 0:
+            raise ValueError("email_verify_ttl_seconds must be positive")
+        if self.rate_limit_password_reset_per_hour <= 0:
+            raise ValueError("rate_limit_password_reset_per_hour must be positive")
+        if self.password_max_length <= self.password_min_length:
+            raise ValueError("password_max_length must exceed password_min_length")
+        # Argon2 strength floors (OWASP argon2id guidance). Enforced only in
+        # strict mode so for_tests() can use fast/weak parameters; a real
+        # deployment with a fat-fingered PYXLE_AUTH_ARGON_* env fails loudly
+        # at startup instead of silently shipping weak hashing.
+        if self.strict:
+            if self.argon_time_cost < 2:
+                raise ValueError("argon_time_cost must be >= 2 in strict mode")
+            if self.argon_memory_kib < 19456:
+                raise ValueError(
+                    "argon_memory_kib must be >= 19456 (19 MiB, OWASP minimum) "
+                    "in strict mode"
+                )
+            if self.argon_parallelism < 1:
+                raise ValueError("argon_parallelism must be >= 1")
 
     # ---- loaders ---------------------------------------------------------------
 
     @classmethod
-    def from_env(cls, *, strict: bool = True) -> "AuthSettings":
-        """Read overrides from the environment. Missing keys use defaults."""
+    def from_env(
+        cls,
+        *,
+        strict: bool = True,
+        overrides: Mapping[str, Any] | None = None,
+    ) -> "AuthSettings":
+        """Read overrides from the environment. Missing keys use defaults.
+
+        ``overrides`` maps field names to values that beat the
+        environment — the pyxle-auth plugin passes the (translated)
+        ``pyxle.config.json`` settings here, so config wins over env.
+        The merged result is validated once, in ``__post_init__``.
+        """
 
         def _int(key: str, default: int) -> int:
             raw = os.environ.get(key)
@@ -121,7 +166,7 @@ class AuthSettings:
         cookie_secure = _bool("PYXLE_AUTH_COOKIE_SECURE", strict)
         cookie_domain = os.environ.get("PYXLE_AUTH_COOKIE_DOMAIN") or None
 
-        return cls(
+        kwargs: dict[str, Any] = dict(
             argon_time_cost=_int("PYXLE_AUTH_ARGON_T", 3),
             argon_memory_kib=_int("PYXLE_AUTH_ARGON_M", 65536),
             argon_parallelism=_int("PYXLE_AUTH_ARGON_P", 2),
@@ -136,23 +181,38 @@ class AuthSettings:
             cookie_secure=cookie_secure,
             cookie_samesite=os.environ.get("PYXLE_AUTH_COOKIE_SAMESITE", "Lax"),
             cookie_domain=cookie_domain,
+            password_reset_ttl_seconds=_int(
+                "PYXLE_AUTH_PASSWORD_RESET_TTL_SECONDS", 1800
+            ),
+            email_verify_ttl_seconds=_int(
+                "PYXLE_AUTH_EMAIL_VERIFY_TTL_SECONDS", 86400
+            ),
             rate_limit_sign_in_per_hour=_int(
                 "PYXLE_AUTH_RL_SIGN_IN_PER_HOUR", 10
             ),
             rate_limit_sign_up_per_hour=_int(
                 "PYXLE_AUTH_RL_SIGN_UP_PER_HOUR", 5
             ),
+            rate_limit_password_reset_per_hour=_int(
+                "PYXLE_AUTH_RATE_LIMIT_PASSWORD_RESET_PER_HOUR", 3
+            ),
             require_email_verified=_bool("PYXLE_AUTH_REQUIRE_VERIFIED", False),
             strict=strict,
         )
+        if overrides:
+            kwargs.update(overrides)
+        return cls(**kwargs)
 
     def for_tests(self) -> "AuthSettings":
-        """Return a copy tuned for fast tests — weak argon, insecure cookie."""
+        """Return a copy tuned for fast tests — weak argon, insecure
+        cookie, short token TTLs."""
         return replace(
             self,
             argon_time_cost=1,
             argon_memory_kib=8,
             argon_parallelism=1,
             cookie_secure=False,
+            password_reset_ttl_seconds=60,
+            email_verify_ttl_seconds=60,
             strict=False,
         )

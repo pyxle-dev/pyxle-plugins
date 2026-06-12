@@ -48,6 +48,17 @@ class WeakPassword(AuthError):
     """Sign-up or password-change rejected for a policy failure."""
 
 
+class InvalidToken(AuthError):
+    """A single-use token (password reset, email verification) was
+    rejected — unknown, expired, already used, or minted for a different
+    purpose. The cases are deliberately indistinguishable so a probing
+    caller learns nothing from the error.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("This link is invalid or has expired.")
+
+
 class EmailNotVerified(AuthError):
     """The account exists and the password matched, but the email
     hasn't been verified and the service requires verification.

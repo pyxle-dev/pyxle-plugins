@@ -45,6 +45,28 @@ class Session:
 
 
 @dataclass(frozen=True, slots=True)
+class SessionInfo:
+    """One row in a user's "active sessions" (devices) screen.
+
+    ``id`` is the session's ``token_sha256`` — safe to expose because it
+    is a one-way hash of the cookie value: possession of the hash cannot
+    resurrect the session, but it uniquely names the row for
+    :meth:`AuthService.revoke_session`.
+
+    ``current`` is ``True`` for the session belonging to the cookie the
+    caller passed to :meth:`AuthService.list_sessions`, so the UI can
+    render "this device".
+    """
+
+    id: str
+    created_at: datetime
+    expires_at: datetime
+    user_agent: str | None
+    ip: str | None
+    current: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class SessionCookie:
     """Cookie attributes for a session.
 
