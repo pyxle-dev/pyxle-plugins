@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check packages/pyxle-db/pyxle_db packages/pyxle-auth/pyxle_auth
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    # Real engines on every run: the live suites (PG + MySQL conformance,
+    # auth schema portability + account lifecycle) are what keep the
+    # "supports PostgreSQL and MySQL" claim honest.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pyxle
+          POSTGRES_PASSWORD: pyxle
+          POSTGRES_DB: pyxle_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U pyxle -d pyxle_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: pyxle
+          MYSQL_USER: pyxle
+          MYSQL_PASSWORD: pyxle
+          MYSQL_DATABASE: pyxle_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ppyxle"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+
+    env:
+      PYXLE_DB_TEST_POSTGRES_URL: postgresql://pyxle:pyxle@127.0.0.1:5432/pyxle_test
+      PYXLE_DB_TEST_MYSQL_URL: mysql://pyxle:pyxle@127.0.0.1:3306/pyxle_test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install packages with all extras
+        run: |
+          pip install -e "packages/pyxle-db[postgres,mysql,dev]"
+          pip install -e "packages/pyxle-auth[dev]"
+
+      - name: pyxle-db tests (SQLite + live PostgreSQL + live MySQL)
+        working-directory: packages/pyxle-db
+        run: python -m pytest -q
+
+      - name: pyxle-auth tests (SQLite + live PostgreSQL + live MySQL)
+        working-directory: packages/pyxle-auth
+        run: python -m pytest -q
+
+      - name: No skipped live suites
+        # A skip here means an engine URL stopped reaching the tests —
+        # the multi-DB claim would silently go unverified again.
+        working-directory: packages/pyxle-db
+        run: |
+          python -m pytest tests/test_backend_postgresql.py tests/test_backend_mysql.py -q -rs | tee /tmp/live.out
+          if grep -q "SKIPPED" /tmp/live.out; then
+            echo "::error::Live-backend tests were skipped; check service containers."
+            exit 1
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - name: Build and check wheels
+        run: |
+          python -m build packages/pyxle-db
+          python -m build packages/pyxle-auth
+          twine check packages/pyxle-db/dist/* packages/pyxle-auth/dist/*

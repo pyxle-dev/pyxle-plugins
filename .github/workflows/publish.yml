@@ -1,0 +1,83 @@
+name: Publish to PyPI
+
+# Per-package releases from one repo. Tag (and GitHub-release) names carry
+# the package:
+#
+#   pyxle-db-v0.2.0      → builds + publishes packages/pyxle-db only
+#   pyxle-auth-v0.2.0    → builds + publishes packages/pyxle-auth only
+#
+# Each package publishes through its OWN GitHub environment
+# (pypi-<package>): PyPI pending publishers are unique on
+# (owner, repo, workflow, environment), so per-package environments let
+# every package — including future ones — register its own pending
+# publisher against this single workflow. Upgrading one plugin never
+# touches another's PyPI history.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve package from the release tag
+    runs-on: ubuntu-latest
+    outputs:
+      dir: ${{ steps.pkg.outputs.dir }}
+      version: ${{ steps.pkg.outputs.version }}
+      environment: ${{ steps.pkg.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: pkg
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # Tag format: <package>-v<version>, where packages/<package> exists.
+          # Generic on purpose — adding a new plugin never touches this
+          # workflow, only a new packages/ directory and its environment.
+          name="${TAG%-v*}"
+          version="${TAG##*-v}"
+          if [ "$name" = "$TAG" ] || [ -z "$version" ]; then
+            echo "::error::Release tag '$TAG' must look like <package>-v<version>, e.g. pyxle-db-v0.2.0"
+            exit 1
+          fi
+          if [ ! -f "packages/$name/pyproject.toml" ]; then
+            echo "::error::Tag names package '$name' but packages/$name/pyproject.toml does not exist."
+            exit 1
+          fi
+          declared=$(grep -m1 '^version = ' "packages/$name/pyproject.toml" | cut -d'"' -f2)
+          if [ "$declared" != "$version" ]; then
+            echo "::error::Tag says $version but packages/$name/pyproject.toml says $declared — bump the version before tagging."
+            exit 1
+          fi
+          echo "dir=packages/$name"      >> "$GITHUB_OUTPUT"
+          echo "version=$version"        >> "$GITHUB_OUTPUT"
+          echo "environment=pypi-$name"  >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build and publish to PyPI
+    needs: resolve
+    runs-on: ubuntu-latest
+    environment: ${{ needs.resolve.outputs.environment }}
+    permissions:
+      contents: read
+      id-token: write  # Required for trusted publishing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build "${{ needs.resolve.outputs.dir }}" --outdir dist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
