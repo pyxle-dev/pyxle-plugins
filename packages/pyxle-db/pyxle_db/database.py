@@ -1,375 +1,190 @@
-"""Async-friendly SQLite wrapper for Pyxle apps.
+"""The public database API — one facade over every supported backend.
 
-Design:
+.. code-block:: python
 
-* Uses the stdlib ``sqlite3`` driver because it's fast, zero-dep, and
-  bundled with every supported Python. ``aiosqlite`` was considered and
-  rejected: it layers a thread per connection on top of stdlib and adds
-  latency without buying us anything the wrapper can't do with
-  ``asyncio.to_thread``.
-* Connection-per-thread pool. SQLite connections are not safe to share
-  across threads by default; we open a fresh connection on first use in
-  a given thread and cache it in ``threading.local``.
-* Every write operation uses a transaction. A connection acquired via
-  :meth:`Database.transaction` commits on successful exit and rolls back
-  on exception.
-* PRAGMAs applied at connection time: ``foreign_keys=ON``,
-  ``journal_mode=WAL``, ``synchronous=NORMAL``, ``busy_timeout=5000``,
-  ``temp_store=MEMORY``, ``cache_size=-65536`` (64 MB per connection).
-  These are the "fast and safe for a web app" defaults; the WAL keeps
-  readers and writers from blocking each other.
+    from pyxle_db import Database
+
+    db = Database("./data/app.db")                       # SQLite (0.1-compatible)
+    db = Database.from_url("postgresql://app:s3c@db/app")  # PostgreSQL
+    db = Database.from_url("mysql://app:s3c@db/app")       # MySQL
+
+    await db.connect()
+    row = await db.fetchone("SELECT * FROM users WHERE id = ?", (uid,))
+    async with db.transaction() as tx:
+        await tx.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (amt, a))
+        await tx.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (amt, b))
+    await db.aclose()
+
+Write SQL once, in canonical qmark style (``?`` placeholders); the facade
+translates per backend (``$1`` for PostgreSQL, ``%s`` for MySQL) with a
+literal-aware rewriter, so user data can never become SQL structure during
+translation. ``??`` escapes a literal question mark (PostgreSQL JSON
+operators).
+
+Changed in 0.2 (breaking): transaction methods are now coroutines —
+``await tx.execute(...)`` — because PostgreSQL/MySQL drivers are natively
+async. SQLite scripts can keep using :meth:`Database.sync_transaction`.
 """
 
 from __future__ import annotations
 
 import asyncio
-import sqlite3
-import threading
 import time
-from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, ContextManager, Iterable, Mapping, Sequence
 
-from pyxle_db.errors import DatabaseError, IntegrityError, NotFoundError
+from pyxle_db.backends import Backend, BackendTransaction, Dialect, create_backend
+from pyxle_db.errors import ConfigurationError, NotFoundError, UnsupportedOperationError
+from pyxle_db.rows import Row
+from pyxle_db.sql import translate
+from pyxle_db.url import DatabaseConfig, parse_database_url
 
-
-# ---------------------------------------------------------------------------
-# datetime adapters
-#
-# Python 3.12 deprecated the stdlib's default datetime/date adapters for
-# sqlite3 — they produced timezone-naive strings which silently broke
-# apps that store UTC timestamps. We register explicit adapters that
-# serialise to a format compatible with SQLite's ``CURRENT_TIMESTAMP``
-# (space separator, no timezone suffix, UTC normalised). This is
-# important because lexicographic comparison of mixed formats silently
-# produces wrong results — "2026-01-01 12:00:00" compares less than
-# "2026-01-01T12:00:00+00:00" because space (0x20) < T (0x54).
-#
-# Every stored datetime is assumed UTC; the converter re-attaches
-# :class:`datetime.timezone.utc` on the way out.
-
-
-_SQLITE_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
-
-
-def _adapt_datetime(value: datetime) -> str:
-    # Normalise to UTC before serialising so comparisons stay stable.
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    else:
-        value = value.astimezone(timezone.utc)
-    # strftime with %f gives microseconds — matches SQLite's own default
-    # to ~second precision while still being sortable.
-    return value.strftime(_SQLITE_DATETIME_FORMAT)
-
-
-def _adapt_date(value: date) -> str:
-    return value.isoformat()
-
-
-def _convert_timestamp(raw: bytes) -> datetime:
-    """Parse a TIMESTAMP column. Tolerant of:
-
-    * ``YYYY-MM-DD HH:MM:SS.ffffff`` (our adapter's output)
-    * ``YYYY-MM-DD HH:MM:SS`` (SQLite's CURRENT_TIMESTAMP)
-    * ``YYYY-MM-DDTHH:MM:SS[.ffffff][+HH:MM]`` (ISO with/without tz)
-
-    Never returns a naive datetime — UTC is assumed for naive values.
-    """
-    s = raw.decode("utf-8")
-    parsed: datetime
-    try:
-        parsed = datetime.strptime(s, _SQLITE_DATETIME_FORMAT)
-    except ValueError:
-        try:
-            parsed = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            # ISO-style fallback (e.g. data migrated in from another source).
-            parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
-
-
-def _convert_date(raw: bytes) -> date:
-    return date.fromisoformat(raw.decode("utf-8"))
-
-
-sqlite3.register_adapter(datetime, _adapt_datetime)
-sqlite3.register_adapter(date, _adapt_date)
-sqlite3.register_converter("TIMESTAMP", _convert_timestamp)
-sqlite3.register_converter("DATE", _convert_date)
-
-
-# ---------------------------------------------------------------------------
-# PRAGMAs applied to every connection on first open.
-#
-# The tuple-of-pairs shape (not a dict) is intentional — order matters.
-# ``journal_mode`` must be set before ``synchronous`` takes its final effect,
-# and ``foreign_keys`` must be set on every connection because SQLite
-# otherwise resets it to OFF.
-
-_PRAGMAS: tuple[tuple[str, str], ...] = (
-    ("journal_mode", "WAL"),
-    ("synchronous", "NORMAL"),
-    ("foreign_keys", "ON"),
-    ("busy_timeout", "5000"),
-    ("temp_store", "MEMORY"),
-    ("cache_size", "-65536"),
-)
-
-
-# ---------------------------------------------------------------------------
-# Row typing
-
-
-Row = sqlite3.Row
 Params = Sequence[Any] | Mapping[str, Any]
 
-
-def _row_factory(cursor: sqlite3.Cursor, row: tuple[Any, ...]) -> sqlite3.Row:
-    """Return ``sqlite3.Row`` so results work as both tuple and mapping."""
-    return sqlite3.Row(cursor, row)
+__all__ = ["Database", "Transaction", "connect", "Row"]
 
 
-# ---------------------------------------------------------------------------
-# Transaction context
+def _normalise_params(params: Params | None, dialect: Dialect) -> Sequence[Any]:
+    if params is None:
+        return ()
+    if isinstance(params, Mapping):
+        # Named parameters only work where the driver supports them natively
+        # and our translator doesn't renumber placeholders.
+        if dialect.name != "sqlite":
+            raise ConfigurationError(
+                "Mapping (named) parameters are SQLite-only; use positional "
+                "qmark parameters for portable SQL"
+            )
+        return params  # type: ignore[return-value]  # sqlite3 accepts mappings
+    return params
 
 
-@dataclass
 class Transaction:
-    """Active transaction scope. Yielded from :meth:`Database.transaction`.
+    """One open transaction. Methods take canonical qmark SQL."""
 
-    The wrapper delegates to the underlying connection for query execution
-    and commits / rolls back automatically when the context exits.
+    __slots__ = ("_tx", "_dialect")
 
-    Attributes:
-        conn: The underlying ``sqlite3.Connection``. Expose only the
-            methods we need so downstream code doesn't start pulling on
-            connection-specific features that would break when we swap
-            drivers.
-    """
+    def __init__(self, tx: BackendTransaction, dialect: Dialect) -> None:
+        self._tx = tx
+        self._dialect = dialect
 
-    conn: sqlite3.Connection
+    async def execute(self, sql: str, params: Params | None = None) -> int:
+        return await self._tx.execute(
+            translate(sql, self._dialect.paramstyle),
+            _normalise_params(params, self._dialect),
+        )
 
-    def execute(self, sql: str, params: Params | None = None) -> sqlite3.Cursor:
-        try:
-            return self.conn.execute(sql, _params(params))
-        except sqlite3.IntegrityError as exc:
-            raise IntegrityError(str(exc)) from exc
-        except sqlite3.Error as exc:
-            raise DatabaseError(str(exc)) from exc
+    async def executemany(self, sql: str, seq_params: Iterable[Params]) -> None:
+        native = translate(sql, self._dialect.paramstyle)
+        await self._tx.executemany(
+            native, [_normalise_params(p, self._dialect) for p in seq_params]
+        )
 
-    def executemany(self, sql: str, seq_params: Iterable[Params]) -> sqlite3.Cursor:
-        try:
-            return self.conn.executemany(sql, [_params(p) for p in seq_params])
-        except sqlite3.IntegrityError as exc:
-            raise IntegrityError(str(exc)) from exc
-        except sqlite3.Error as exc:
-            raise DatabaseError(str(exc)) from exc
+    async def fetchone(self, sql: str, params: Params | None = None) -> Row | None:
+        return await self._tx.fetchone(
+            translate(sql, self._dialect.paramstyle),
+            _normalise_params(params, self._dialect),
+        )
 
-    def fetchone(self, sql: str, params: Params | None = None) -> Row | None:
-        return self.execute(sql, params).fetchone()
+    async def fetchall(self, sql: str, params: Params | None = None) -> list[Row]:
+        return await self._tx.fetchall(
+            translate(sql, self._dialect.paramstyle),
+            _normalise_params(params, self._dialect),
+        )
 
-    def fetchall(self, sql: str, params: Params | None = None) -> list[Row]:
-        return self.execute(sql, params).fetchall()
-
-    def get(self, sql: str, params: Params | None = None) -> Row:
+    async def get(self, sql: str, params: Params | None = None) -> Row:
         """Fetch one row; raise :class:`NotFoundError` if there isn't one."""
-        row = self.fetchone(sql, params)
+        row = await self.fetchone(sql, params)
         if row is None:
             raise NotFoundError(f"No row for query: {sql}")
         return row
 
 
-def _params(p: Params | None) -> Params:
-    """Normalise the ``None`` case so callers don't need a guard."""
-    return () if p is None else p
-
-
-# ---------------------------------------------------------------------------
-# Database
-
-
 class Database:
-    """Connection-pooled SQLite wrapper.
+    """Backend-agnostic database handle. Open once, share app-wide."""
 
-    Open once at app startup, close at shutdown:
-
-    .. code-block:: python
-
-        db = Database(":memory:")
-        try:
-            async with db.transaction() as tx:
-                tx.execute("CREATE TABLE ...")
-        finally:
-            db.close()
-
-    Or, using the :func:`connect` convenience:
-
-    .. code-block:: python
-
-        db = await connect("app.db", migrations_dir="migrations")
-    """
-
-    def __init__(self, path: str | Path) -> None:
-        self._path = str(path)
-        self._local = threading.local()
-        self._lock = threading.Lock()
-        # Track every connection we hand out so :meth:`close` can close them
-        # even if they were created on a thread that has since ended.
-        self._connections: list[sqlite3.Connection] = []
-        # Monotonic counter of queries served. Exposed for metrics.
+    def __init__(self, path_or_url: str | Path) -> None:
+        self._config: DatabaseConfig = parse_database_url(str(path_or_url))
+        self._backend: Backend = create_backend(self._config)
+        self._connected = False
+        self._connect_lock = asyncio.Lock()
         self._query_count = 0
 
-    # ---- connection management -------------------------------------------------
+    # -- construction --------------------------------------------------------
 
-    def _thread_conn(self) -> sqlite3.Connection:
-        conn = getattr(self._local, "conn", None)
-        if conn is not None:
-            return conn
-        conn = sqlite3.connect(
-            self._path,
-            isolation_level=None,  # manage transactions explicitly
-            detect_types=sqlite3.PARSE_DECLTYPES,
-            check_same_thread=False,
-            timeout=5.0,
-        )
-        conn.row_factory = _row_factory
-        for name, value in _PRAGMAS:
-            conn.execute(f"PRAGMA {name} = {value}")
-        self._local.conn = conn
-        with self._lock:
-            self._connections.append(conn)
-        return conn
+    @classmethod
+    def from_url(cls, url: str) -> "Database":
+        """Explicit-name twin of the constructor; reads better at call sites."""
+        return cls(url)
+
+    # -- lifecycle ------------------------------------------------------------
+
+    async def connect(self) -> None:
+        """Open pools / verify connectivity. Idempotent and lazy-safe:
+        every query path calls this, so explicit use is optional."""
+        if self._connected:
+            return
+        async with self._connect_lock:
+            if not self._connected:
+                await self._backend.connect()
+                self._connected = True
+
+    async def aclose(self) -> None:
+        """Release every connection. Works on every backend."""
+        await self._backend.aclose()
+        self._connected = False
 
     def close(self) -> None:
-        """Close every connection we've opened. Idempotent."""
-        with self._lock:
-            conns, self._connections = self._connections, []
-        for conn in conns:
-            try:
-                conn.close()
-            except sqlite3.Error:
-                # Best-effort; nothing useful we can do on close failure.
-                pass
+        """Synchronous close — SQLite only (0.1 compatibility).
 
-    # ---- query helpers ---------------------------------------------------------
-
-    @contextmanager
-    def _sync_transaction(self) -> Iterator[Transaction]:
-        conn = self._thread_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        tx = Transaction(conn)
-        try:
-            yield tx
-        except BaseException:
-            conn.execute("ROLLBACK")
-            raise
-        else:
-            conn.execute("COMMIT")
-        finally:
-            self._query_count += 1
-
-    class _AsyncTxCtx:
-        """Async-friendly transaction context manager.
-
-        Acquires the connection in a worker thread (so we don't block the
-        event loop on the ``BEGIN IMMEDIATE`` when the write-lock is
-        contended) and delivers a :class:`Transaction` back to the caller.
+        Server backends hold async pools; call ``await db.aclose()``.
         """
+        sync_close = getattr(self._backend, "close_sync", None)
+        if sync_close is None:
+            raise UnsupportedOperationError(
+                f"close() is SQLite-only; the {self.dialect.name} backend "
+                "needs `await db.aclose()`"
+            )
+        sync_close()
+        self._connected = False
 
-        def __init__(self, db: "Database") -> None:
-            self._db = db
-            self._conn: sqlite3.Connection | None = None
+    # -- queries ---------------------------------------------------------------
 
-        async def __aenter__(self) -> Transaction:
-            self._conn = await asyncio.to_thread(self._begin)
-            return Transaction(self._conn)
-
-        def _begin(self) -> sqlite3.Connection:
-            conn = self._db._thread_conn()
-            conn.execute("BEGIN IMMEDIATE")
-            return conn
-
-        async def __aexit__(
-            self,
-            exc_type: type[BaseException] | None,
-            exc: BaseException | None,
-            tb: object,
-        ) -> bool:
-            conn = self._conn
-            assert conn is not None
-            if exc is None:
-                await asyncio.to_thread(conn.execute, "COMMIT")
-            else:
-                await asyncio.to_thread(conn.execute, "ROLLBACK")
-            self._db._query_count += 1
-            return False
-
-    def transaction(self) -> "Database._AsyncTxCtx":
-        """Open an async transaction scope.
-
-        .. code-block:: python
-
-            async with db.transaction() as tx:
-                tx.execute("INSERT ...", (value,))
-        """
-        return Database._AsyncTxCtx(self)
-
-    def sync_transaction(self) -> "contextmanager[Transaction]":  # pragma: no cover - typing helper
-        """Synchronous variant, for scripts and migrations.
-
-        Use :meth:`transaction` inside async request handlers.
-        """
-        return self._sync_transaction()
-
-    # ---- one-shot query helpers ------------------------------------------------
-
-    async def execute(self, sql: str, params: Params | None = None) -> None:
-        """Run a single write and commit."""
-
-        def _run() -> None:
-            with self._sync_transaction() as tx:
-                tx.execute(sql, params)
-
-        await asyncio.to_thread(_run)
+    async def execute(self, sql: str, params: Params | None = None) -> int:
+        """Run a single write and commit. Returns the affected rowcount
+        (-1 when the backend can't tell)."""
+        await self.connect()
+        affected = await self._backend.execute(
+            translate(sql, self.dialect.paramstyle),
+            _normalise_params(params, self.dialect),
+        )
+        self._query_count += 1
+        return affected
 
     async def executemany(self, sql: str, seq_params: Iterable[Params]) -> None:
-        """Bulk-insert flavoured write. Runs in one transaction."""
-        materialised = [p for p in seq_params]
-
-        def _run() -> None:
-            with self._sync_transaction() as tx:
-                tx.executemany(sql, materialised)
-
-        await asyncio.to_thread(_run)
+        """Bulk write; the whole batch is one transaction."""
+        await self.connect()
+        native = translate(sql, self.dialect.paramstyle)
+        await self._backend.executemany(
+            native, [_normalise_params(p, self.dialect) for p in seq_params]
+        )
+        self._query_count += 1
 
     async def fetchone(self, sql: str, params: Params | None = None) -> Row | None:
-        def _run() -> Row | None:
-            conn = self._thread_conn()
-            cur = conn.execute(sql, _params(params))
-            try:
-                return cur.fetchone()
-            finally:
-                cur.close()
-
+        await self.connect()
         self._query_count += 1
-        return await asyncio.to_thread(_run)
+        return await self._backend.fetchone(
+            translate(sql, self.dialect.paramstyle),
+            _normalise_params(params, self.dialect),
+        )
 
     async def fetchall(self, sql: str, params: Params | None = None) -> list[Row]:
-        def _run() -> list[Row]:
-            conn = self._thread_conn()
-            cur = conn.execute(sql, _params(params))
-            try:
-                return cur.fetchall()
-            finally:
-                cur.close()
-
+        await self.connect()
         self._query_count += 1
-        return await asyncio.to_thread(_run)
+        return await self._backend.fetchall(
+            translate(sql, self.dialect.paramstyle),
+            _normalise_params(params, self.dialect),
+        )
 
     async def get(self, sql: str, params: Params | None = None) -> Row:
         """Fetch one row; raise :class:`NotFoundError` if none."""
@@ -378,53 +193,106 @@ class Database:
             raise NotFoundError(f"No row for query: {sql}")
         return row
 
-    # ---- maintenance -----------------------------------------------------------
+    # -- transactions ------------------------------------------------------------
+
+    def transaction(self) -> "_TxCtx":
+        """Async transaction scope::
+
+            async with db.transaction() as tx:
+                await tx.execute("INSERT ...", (value,))
+        """
+        return _TxCtx(self)
+
+    def sync_transaction(self) -> ContextManager["Any"]:
+        """Synchronous transaction — SQLite only, for scripts and tests.
+
+        Inside async request handlers always use :meth:`transaction`.
+
+        Translation contract: the backend's sync transaction object applies
+        the qmark translation itself (the facade hands it straight through),
+        so the ``??`` escape behaves identically on both paths.
+        """
+        sync_tx = getattr(self._backend, "sync_transaction", None)
+        if sync_tx is None:
+            raise UnsupportedOperationError(
+                f"sync_transaction() is SQLite-only; the {self.dialect.name} "
+                "backend needs `async with db.transaction()`"
+            )
+        self._query_count += 1
+        return sync_tx()
+
+    # -- maintenance / introspection ----------------------------------------------
 
     async def vacuum(self) -> None:
-        """Run ``VACUUM``. Rarely needed with WAL, but useful for tests."""
-        await asyncio.to_thread(self._thread_conn().execute, "VACUUM")
+        """``VACUUM`` (SQLite). Server backends manage their own maintenance."""
+        if self.dialect.name != "sqlite":
+            raise UnsupportedOperationError(
+                f"vacuum() is SQLite-only (got {self.dialect.name})"
+            )
+        await self.connect()
+        await self._backend.execute("VACUUM", ())
 
-    # ---- metrics ---------------------------------------------------------------
+    @property
+    def dialect(self) -> Dialect:
+        return self._backend.dialect
+
+    @property
+    def config(self) -> DatabaseConfig:
+        return self._config
 
     @property
     def query_count(self) -> int:
-        """Total transactions committed or rolled back since open."""
+        """Facade-level operations served since open. Exposed for metrics."""
         return self._query_count
-
-    # ---- path / introspection --------------------------------------------------
 
     @property
     def path(self) -> str:
-        return self._path
+        """SQLite file path, or a password-redacted URL for server backends."""
+        if self._config.backend == "sqlite":
+            return self._config.path
+        return self._config.redacted()
 
 
-# ---------------------------------------------------------------------------
-# Convenience factory
+class _TxCtx:
+    __slots__ = ("_db", "_inner")
+
+    def __init__(self, db: Database) -> None:
+        self._db = db
+        self._inner: Any = None
+
+    async def __aenter__(self) -> Transaction:
+        await self._db.connect()
+        self._inner = self._db._backend.transaction()
+        backend_tx = await self._inner.__aenter__()
+        return Transaction(backend_tx, self._db.dialect)
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool | None:
+        self._db._query_count += 1
+        return await self._inner.__aexit__(exc_type, exc, tb)
 
 
 async def connect(
-    path: str | Path,
+    path_or_url: str | Path,
     *,
     migrations_dir: str | Path | None = None,
     wait_for_file_ms: int = 0,
 ) -> Database:
-    """Open a :class:`Database` and optionally apply migrations.
+    """Open a :class:`Database`, optionally applying migrations.
 
-    ``wait_for_file_ms`` is useful when opening a path that another
-    process is just finishing creating (e.g. a test harness starting
-    the server under test). Defaults to 0 — no wait.
+    Accepts everything :class:`Database` accepts (bare SQLite path or any
+    database URL). ``wait_for_file_ms`` tolerates a transient "SQLite file
+    doesn't exist yet" race when another process is creating it.
     """
-    # Lazy import to keep Database importable without migrator deps.
-    from pyxle_db.migrator import Migrator
+    from pyxle_db.migrator import Migrator  # lazy: keep import surface lean
 
-    path_str = str(path)
+    db = Database(path_or_url)
 
-    if wait_for_file_ms and path_str != ":memory:":
+    if wait_for_file_ms and db.config.backend == "sqlite" and db.config.path != ":memory:":
         deadline = time.monotonic() + wait_for_file_ms / 1000.0
-        while not Path(path_str).exists() and time.monotonic() < deadline:
+        while not Path(db.config.path).exists() and time.monotonic() < deadline:
             await asyncio.sleep(0.05)
 
-    db = Database(path_str)
+    await db.connect()
     if migrations_dir is not None:
         migrator = Migrator(db, Path(migrations_dir))
         await migrator.apply_all()

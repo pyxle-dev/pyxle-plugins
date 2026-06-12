@@ -3,47 +3,76 @@
 Conventions:
 
 * Each migration is a ``.sql`` file in the migrations directory.
-* Filenames must start with a zero-padded numeric prefix (``0001``,
-  ``0002``, ...) followed by a hyphen and a description:
-  ``0001-initial-schema.sql``. The numeric prefix is the canonical
-  ordering; the description is freeform and recorded for humans.
-* A migration is applied exactly once per database. We record every
-  applied migration in a ``schema_migrations`` table with its SHA-256
-  so edits to committed migrations are detected and rejected.
-* Each migration runs in its own transaction. A failure rolls back
-  that migration only; previously-applied migrations are untouched.
-* Migrations execute SQL as-is — this includes multi-statement
-  scripts. No templating, no variable substitution.
+* Filenames start with a zero-padded numeric prefix (``0001``, ``0002``,
+  ...) followed by a separator and a slug: ``0001-initial-schema.sql``.
+  The numeric prefix is the canonical ordering; the slug is freeform and
+  recorded for humans.
+* A migration may ship a per-backend override named
+  ``<NNN>-<slug>.<dialect>.sql`` (e.g. ``0002-indexes.postgresql.sql``).
+  On that dialect the override is the effective file; every other dialect
+  uses the base file. An override without a base file is a backend-only
+  migration — the other dialects skip that id entirely.
+* The migration id is ``<NNN>-<slug>``, dialect-independent, so the same
+  logical migration is recorded under one id on every backend. Two files
+  that resolve to the same id for the same effective dialect are rejected
+  at :meth:`Migrator.discover`.
+* A migration is applied exactly once per database. Every applied
+  migration is recorded in a ``schema_migrations`` table with the SHA-256
+  of the *effective* file's content — so a PostgreSQL and a SQLite
+  database may legitimately record different checksums for the same id.
+  Editing a migration after it was applied (including adding an override
+  for an already-applied id) is detected per database and rejected.
+* Each migration runs in its own transaction: statements execute
+  sequentially and the ``schema_migrations`` insert rides the same
+  transaction, so a failure rolls back that migration completely and
+  leaves previously-applied migrations untouched.
+* Migration SQL passes through the :class:`pyxle_db.Database` facade like
+  any other SQL, so the canonical placeholder rules apply: write ``??``
+  for a literal question mark (PostgreSQL JSON operators). There is no
+  templating or variable substitution.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from pyxle_db.backends import MYSQL_DIALECT, POSTGRESQL_DIALECT, SQLITE_DIALECT
 from pyxle_db.database import Database
 from pyxle_db.errors import MigrationChecksumMismatch, MigrationError
+from pyxle_db.sql import split_statements
 
+_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
 
-_FILENAME_RE = re.compile(r"^(?P<prefix>\d{3,})[-_](?P<slug>[A-Za-z0-9_\-]+)\.sql$")
+_DIALECT_NAMES = frozenset(
+    dialect.name for dialect in (SQLITE_DIALECT, POSTGRESQL_DIALECT, MYSQL_DIALECT)
+)
+
+_FILENAME_RE = re.compile(
+    r"^(?P<prefix>\d{3,})[-_](?P<slug>[A-Za-z0-9_\-]+)"
+    rf"(?:\.(?P<dialect>{'|'.join(sorted(_DIALECT_NAMES))}))?\.sql$"
+)
 
 
 @dataclass(frozen=True, slots=True)
 class Migration:
-    """A single migration file, ready to apply.
+    """A single migration, resolved for one dialect and ready to apply.
 
     Attributes:
-        id: The filename minus the ``.sql`` suffix. Used as the
-            primary key in ``schema_migrations``.
+        id: ``<NNN>-<slug>`` — dialect-independent; the primary key in
+            ``schema_migrations``.
         prefix: The numeric prefix, parsed for ordering.
         slug: The human-readable description.
-        source_path: Absolute path on disk.
-        sql: The SQL to execute.
-        checksum: SHA-256 of the SQL text, hex-encoded.
+        source_path: The effective file on disk — the per-dialect override
+            when one exists, the base file otherwise.
+        sql: The contents of the effective file.
+        checksum: SHA-256 of the effective file's content, hex-encoded.
+            Because overrides differ per backend, databases of different
+            dialects may record different checksums for the same id —
+            that is expected and correct.
     """
 
     id: str
@@ -54,8 +83,99 @@ class Migration:
     checksum: str
 
 
+@dataclass(frozen=True, slots=True)
+class _MigrationFile:
+    """A parsed migration filename; contents are not read at this stage."""
+
+    path: Path
+    id: str
+    prefix: int
+    slug: str
+    dialect: str | None
+
+
+def _parse_filename(path: Path) -> _MigrationFile:
+    match = _FILENAME_RE.match(path.name)
+    if match is None:
+        raise MigrationError(
+            f"Migration filename {path.name!r} does not match "
+            "<NNN>-<slug>[.<dialect>].sql (e.g. 0001-initial-schema.sql "
+            "or 0002-indexes.postgresql.sql)"
+        )
+    prefix = match.group("prefix")
+    slug = match.group("slug")
+    return _MigrationFile(
+        path=path,
+        id=f"{prefix}-{slug}",
+        prefix=int(prefix),
+        slug=slug,
+        dialect=match.group("dialect"),
+    )
+
+
+def select_migration_files(files: Iterable[Path], dialect_name: str) -> list[Path]:
+    """Pick the effective migration file per id for ``dialect_name``.
+
+    Pure function over filenames — no I/O — so override resolution is
+    testable without a database server. Rules:
+
+    * ``<NNN>-<slug>.<dialect>.sql`` beats ``<NNN>-<slug>.sql`` when
+      ``dialect`` equals ``dialect_name``.
+    * Overrides for other dialects are ignored.
+    * An override with no base file is a backend-only migration: selected
+      on its dialect, silently skipped everywhere else.
+
+    Returns the effective paths sorted by numeric prefix. Raises
+    :class:`MigrationError` for a malformed filename, two files resolving
+    to the same id for the same dialect, an unknown ``dialect_name``, or
+    two distinct migration ids sharing a numeric prefix.
+    """
+    if dialect_name not in _DIALECT_NAMES:
+        raise MigrationError(
+            f"Unknown dialect {dialect_name!r}; expected one of "
+            f"{sorted(_DIALECT_NAMES)}"
+        )
+
+    parsed = sorted(
+        (_parse_filename(path) for path in files), key=lambda f: f.path.name
+    )
+
+    seen: dict[tuple[str, str | None], _MigrationFile] = {}
+    for file in parsed:
+        clash = seen.get((file.id, file.dialect))
+        if clash is not None:
+            scope = f"dialect {file.dialect!r}" if file.dialect else "every dialect"
+            raise MigrationError(
+                f"{clash.path.name} and {file.path.name} both resolve to the "
+                f"same migration id {file.id!r} for {scope}"
+            )
+        seen[(file.id, file.dialect)] = file
+
+    prefix_owners: dict[int, str] = {}
+    for file in parsed:
+        owner = prefix_owners.setdefault(file.prefix, file.id)
+        if owner != file.id:
+            raise MigrationError(
+                f"Two migrations share prefix {file.prefix}: "
+                f"{owner!r} and {file.id!r}"
+            )
+
+    effective: dict[str, _MigrationFile] = {}
+    for file in parsed:
+        if file.dialect is None:
+            effective.setdefault(file.id, file)
+    for file in parsed:
+        if file.dialect == dialect_name:
+            effective[file.id] = file
+
+    return [f.path for f in sorted(effective.values(), key=lambda f: f.prefix)]
+
+
 class Migrator:
-    """Applies ordered migrations to a :class:`Database`.
+    """Applies ordered migrations to a :class:`Database` of any backend.
+
+    All database access goes through the facade's async API, so the same
+    migrator works on SQLite, PostgreSQL, and MySQL.
 
     .. code-block:: python
 
@@ -63,75 +183,92 @@ class Migrator:
         await migrator.apply_all()
     """
 
-    def __init__(self, db: Database, directory: Path) -> None:
+    def __init__(
+        self,
+        db: Database,
+        directory: Path,
+        *,
+        tracking_table: str = "schema_migrations",
+    ) -> None:
         if not directory.is_dir():
             raise MigrationError(
                 f"Migrations directory does not exist: {directory}"
             )
+        # The tracking table name is interpolated into DDL/DML, so it must be
+        # a plain identifier — never attacker-controlled, but validated so a
+        # typo fails loudly instead of producing malformed SQL. Distinct
+        # tables let independent migration sources (e.g. a host app and the
+        # pyxle-auth plugin) share ONE database without each seeing the
+        # other's migrations as drift.
+        if not _IDENTIFIER_RE.match(tracking_table):
+            raise MigrationError(
+                f"Invalid tracking_table name: {tracking_table!r} "
+                "(use lowercase letters, digits, and underscores)"
+            )
         self._db = db
         self._directory = directory
+        self._table = tracking_table
 
     # ---- discovery -------------------------------------------------------------
 
     def discover(self) -> list[Migration]:
-        """Read every migration file from disk, sorted by prefix.
+        """Read every effective migration for this database's dialect.
 
-        Raises :class:`MigrationError` if two files share the same prefix
-        or if any filename is malformed.
+        Returns migrations sorted by numeric prefix. Per-dialect override
+        files are resolved against :attr:`Database.dialect`; see
+        :func:`select_migration_files` for the rules and the errors raised
+        for malformed or conflicting filenames.
         """
-        found: dict[int, Migration] = {}
-        for entry in sorted(self._directory.iterdir()):
-            if not entry.is_file() or entry.suffix != ".sql":
-                continue
-            match = _FILENAME_RE.match(entry.name)
-            if not match:
-                raise MigrationError(
-                    f"Migration filename {entry.name!r} does not match "
-                    "<NNN>-<slug>.sql (e.g. 0001-initial-schema.sql)"
+        files = [
+            entry
+            for entry in self._directory.iterdir()
+            if entry.is_file() and entry.suffix == ".sql"
+        ]
+        migrations: list[Migration] = []
+        for path in select_migration_files(files, self._db.dialect.name):
+            parsed = _parse_filename(path)
+            sql = path.read_text(encoding="utf-8")
+            migrations.append(
+                Migration(
+                    id=parsed.id,
+                    prefix=parsed.prefix,
+                    slug=parsed.slug,
+                    source_path=path,
+                    sql=sql,
+                    checksum=hashlib.sha256(sql.encode("utf-8")).hexdigest(),
                 )
-            prefix = int(match.group("prefix"))
-            if prefix in found:
-                raise MigrationError(
-                    f"Two migrations share prefix {prefix}: "
-                    f"{found[prefix].source_path.name} and {entry.name}"
-                )
-            sql = entry.read_text(encoding="utf-8")
-            checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
-            found[prefix] = Migration(
-                id=entry.stem,
-                prefix=prefix,
-                slug=match.group("slug"),
-                source_path=entry,
-                sql=sql,
-                checksum=checksum,
             )
-        return [found[prefix] for prefix in sorted(found)]
+        return migrations
 
     # ---- application -----------------------------------------------------------
 
     async def apply_all(self) -> list[Migration]:
-        """Apply every un-applied migration. Returns the list applied.
+        """Apply every un-applied migration. Returns the list applied now.
 
-        Safe to call on every app startup: a migration is applied
-        exactly once and subsequent calls become a no-op for anything
-        already recorded.
+        Safe to call on every app startup: a migration is applied exactly
+        once and subsequent calls become a no-op for anything already
+        recorded.
 
         Raises :class:`MigrationChecksumMismatch` if a previously-applied
-        migration's content on disk no longer matches what was recorded.
+        migration's effective content on disk no longer matches what was
+        recorded, and :class:`MigrationError` if an applied migration has
+        disappeared from the directory or a pending migration fails.
         """
-        return await asyncio.to_thread(self._apply_all_sync)
-
-    def _apply_all_sync(self) -> list[Migration]:
-        self._ensure_tracking_table()
-        applied_rows = self._load_applied()
-
-        pending: list[Migration] = []
         discovered = self.discover()
-        by_id = {m.id: m for m in discovered}
 
-        # Checksum drift: every recorded migration must either exist on
-        # disk with a matching hash or be flagged as missing.
-        for migration_id, recorded_hash in applied_rows.items():
+        # The tracking table must exist before we can read what's applied.
+        # The dialect DDL targets the default name; rebind it to ours.
+        ddl = self._db.dialect.migrations_table_ddl.replace(
+            "schema_migrations", self._table
+        )
+        await self._db.execute(ddl)
+        rows = await self._db.fetchall(f"SELECT id, checksum FROM {self._table}")
+        applied = {row["id"]: row["checksum"] for row in rows}
+
+        # Checksum drift: every recorded migration must still exist on
+        # disk (for this dialect) with a matching hash.
+        by_id = {migration.id: migration for migration in discovered}
+        for migration_id, recorded_hash in applied.items():
             on_disk = by_id.get(migration_id)
             if on_disk is None:
                 raise MigrationError(
@@ -146,165 +283,31 @@ class Migrator:
                     actual_hash=on_disk.checksum,
                 )
 
-        for migration in discovered:
-            if migration.id in applied_rows:
-                continue
-            pending.append(migration)
-
         applied_now: list[Migration] = []
-        for migration in pending:
-            self._apply_one(migration)
+        for migration in discovered:
+            if migration.id in applied:
+                continue
+            await self._apply_one(migration)
             applied_now.append(migration)
         return applied_now
 
     # ---- internals -------------------------------------------------------------
 
-    def _ensure_tracking_table(self) -> None:
-        with self._db.sync_transaction() as tx:
-            tx.execute(
-                """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    id          TEXT PRIMARY KEY,
-                    checksum    TEXT NOT NULL,
-                    applied_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-
-    def _load_applied(self) -> dict[str, str]:
-        with self._db.sync_transaction() as tx:
-            rows = tx.fetchall("SELECT id, checksum FROM schema_migrations")
-        return {row["id"]: row["checksum"] for row in rows}
-
-    def _apply_one(self, migration: Migration) -> None:
-        # Each migration gets its own transaction. SQLite's ``executescript``
-        # commits and re-opens a transaction implicitly; we side-step that by
-        # running statements individually within our BEGIN IMMEDIATE.
-        statements = _split_sql(migration.sql)
+    async def _apply_one(self, migration: Migration) -> None:
+        # One transaction per migration: the script's statements and the
+        # schema_migrations insert commit together or not at all.
+        statements = split_statements(
+            migration.sql, dialect_name=self._db.dialect.name
+        )
         try:
-            with self._db.sync_transaction() as tx:
-                for stmt in statements:
-                    if stmt.strip():
-                        tx.execute(stmt)
-                tx.execute(
-                    "INSERT INTO schema_migrations (id, checksum) VALUES (?, ?)",
+            async with self._db.transaction() as tx:
+                for statement in statements:
+                    await tx.execute(statement)
+                await tx.execute(
+                    f"INSERT INTO {self._table} (id, checksum) VALUES (?, ?)",
                     (migration.id, migration.checksum),
                 )
         except Exception as exc:
             raise MigrationError(
                 f"Migration {migration.id!r} failed: {exc}"
             ) from exc
-
-
-# ---------------------------------------------------------------------------
-# SQL splitter
-#
-# SQLite's ``execute`` runs one statement at a time. We split on semicolons
-# outside of strings and comments. This is deliberately simple — if a
-# migration needs triggers or procedures with embedded semicolons it can
-# wrap the body in ``BEGIN`` / ``END`` and we'll detect that.
-
-
-def _split_sql(script: str) -> Iterable[str]:
-    out: list[str] = []
-    buf: list[str] = []
-    i = 0
-    n = len(script)
-    in_single = False
-    in_double = False
-    in_line_comment = False
-    in_block_comment = False
-    begin_depth = 0
-
-    while i < n:
-        ch = script[i]
-        nxt = script[i + 1] if i + 1 < n else ""
-        if in_line_comment:
-            buf.append(ch)
-            if ch == "\n":
-                in_line_comment = False
-            i += 1
-            continue
-        if in_block_comment:
-            buf.append(ch)
-            if ch == "*" and nxt == "/":
-                buf.append(nxt)
-                i += 2
-                in_block_comment = False
-                continue
-            i += 1
-            continue
-        if in_single:
-            buf.append(ch)
-            if ch == "'" and nxt == "'":
-                buf.append(nxt)
-                i += 2
-                continue
-            if ch == "'":
-                in_single = False
-            i += 1
-            continue
-        if in_double:
-            buf.append(ch)
-            if ch == '"' and nxt == '"':
-                buf.append(nxt)
-                i += 2
-                continue
-            if ch == '"':
-                in_double = False
-            i += 1
-            continue
-        # not inside any quoted/comment region
-        if ch == "-" and nxt == "-":
-            in_line_comment = True
-            buf.append(ch)
-            i += 1
-            continue
-        if ch == "/" and nxt == "*":
-            in_block_comment = True
-            buf.append(ch)
-            buf.append(nxt)
-            i += 2
-            continue
-        if ch == "'":
-            in_single = True
-            buf.append(ch)
-            i += 1
-            continue
-        if ch == '"':
-            in_double = True
-            buf.append(ch)
-            i += 1
-            continue
-        # BEGIN/END blocks — simple keyword detection; SQLite doesn't have
-        # nested BEGINs in migrations in practice so a depth counter is enough.
-        lookahead = script[i : i + 6].upper()
-        if lookahead.startswith("BEGIN") and _is_word_boundary(script, i, 5):
-            begin_depth += 1
-        elif lookahead.startswith("END") and _is_word_boundary(script, i, 3):
-            if begin_depth > 0:
-                begin_depth -= 1
-        if ch == ";" and begin_depth == 0:
-            out.append("".join(buf))
-            buf = []
-            i += 1
-            continue
-        buf.append(ch)
-        i += 1
-    tail = "".join(buf).strip()
-    if tail:
-        out.append(tail)
-    return out
-
-
-def _is_word_boundary(s: str, start: int, length: int) -> bool:
-    """True if ``s[start:start+length]`` is a standalone word.
-
-    Used so ``ENDING`` doesn't get counted as ``END``.
-    """
-    end = start + length
-    before = s[start - 1] if start > 0 else " "
-    after = s[end] if end < len(s) else " "
-    return not (before.isalnum() or before == "_") and not (
-        after.isalnum() or after == "_"
-    )

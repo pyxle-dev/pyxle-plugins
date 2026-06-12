@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-db"
-version = "0.1.0"
-description = "SQLite-first database plugin for Pyxle: connection pool, migrations, typed query helpers."
+version = "0.2.0"
+description = "Database plugin for Pyxle: SQLite, PostgreSQL, and MySQL with one explicit-SQL API, portable qmark placeholders, and checksum-tracked migrations."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
   { name = "Pyxle", email = "dev@pyxle.dev" },
 ]
-keywords = ["pyxle", "sqlite", "database", "migrations"]
+keywords = ["pyxle", "sqlite", "postgresql", "mysql", "database", "migrations"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Framework :: AsyncIO",
@@ -21,22 +21,33 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Database",
 ]
 dependencies = [
-  "pyxle-framework>=0.2.4",
+  "pyxle-framework>=0.4.0",
 ]
 
 [project.optional-dependencies]
+postgres = [
+  "asyncpg>=0.29",
+]
+mysql = [
+  "asyncmy>=0.2.9",
+  # MySQL 8's default caching_sha2_password auth needs this at connect time;
+  # without it every modern server greets users with a RuntimeError.
+  "cryptography>=42",
+]
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
-  "pytest-cov>=5.0",
 ]
 
 [project.urls]
 Homepage = "https://pyxle.dev"
-Source = "https://github.com/pyxle-framework/pyxle-plugins"
+Source = "https://github.com/pyxle-dev/pyxle-plugins"
+Changelog = "https://github.com/pyxle-dev/pyxle-plugins/blob/main/packages/pyxle-db/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["pyxle_db"]
