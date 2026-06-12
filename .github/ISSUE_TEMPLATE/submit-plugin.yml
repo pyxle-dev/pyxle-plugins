@@ -1,0 +1,58 @@
+name: Submit a plugin
+description: Submit a community plugin for the pyxle.dev directory (and a founding slot, while they last)
+title: "[plugin] "
+labels: ["plugin-submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Submitting early is encouraged — open this as soon as you start building so the
+        idea is visibly claimed and we can review while you build. The bar is the
+        [plugin standards](https://pyxle.dev/docs/plugins/standards); the offer is on
+        [pyxle.dev/plugins](https://pyxle.dev/plugins).
+  - type: input
+    id: name
+    attributes:
+      label: Plugin name (your own PyPI name — bare pyxle-* is reserved for official plugins)
+      placeholder: acme-mail
+    validations:
+      required: true
+  - type: input
+    id: repo
+    attributes:
+      label: Repository URL
+    validations:
+      required: true
+  - type: input
+    id: pypi
+    attributes:
+      label: PyPI URL (or "not published yet")
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What it does
+      description: Two or three sentences. What services/middleware does it register? Which contracts does it build against (e.g. pyxle_db.DatabaseLike)?
+    validations:
+      required: true
+  - type: dropdown
+    id: status
+    attributes:
+      label: Status
+      options:
+        - Just starting — claiming the idea
+        - Building — review welcome
+        - Ready for directory review
+    validations:
+      required: true
+  - type: checkboxes
+    id: standards
+    attributes:
+      label: Standards checklist (required for directory review, not for claiming)
+      options:
+        - label: Own test suite, green in CI
+        - label: README with quickstart, settings table, and scope-honesty section
+        - label: LICENSE + py.typed + CHANGELOG ship in the wheel
+        - label: Fail-loud startup; secrets from environment, never the committed config
+        - label: I've read the plugin standards page and the security section in particular

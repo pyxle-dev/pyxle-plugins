@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling>=1.25,<2.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyxle-flags"
+version = "0.0.1"
+description = "Reserved for a future official Pyxle plugin. Community plugins ship under their own names - see https://pyxle.dev/plugins."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Shivam Saini", email = "dev@pyxle.dev" }]
+classifiers = [
+  "Development Status :: 1 - Planning",
+]
+
+[project.urls]
+Homepage = "https://pyxle.dev/plugins"
+Roadmap = "https://pyxle.dev/docs/plugins/ideas"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyxle_flags"]
