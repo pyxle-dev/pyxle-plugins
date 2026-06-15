@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff
-      - run: ruff check packages/pyxle-db/pyxle_db packages/pyxle-auth/pyxle_auth
+      - run: ruff check packages/pyxle-db/pyxle_db packages/pyxle-auth/pyxle_auth packages/pyxle-mail/pyxle_mail
 
   test:
     runs-on: ubuntu-latest
@@ -66,6 +66,7 @@ jobs:
         run: |
           pip install -e "packages/pyxle-db[postgres,mysql,dev]"
           pip install -e "packages/pyxle-auth[dev]"
+          pip install -e "packages/pyxle-mail[resend,dev]"
 
       - name: pyxle-db tests (SQLite + live PostgreSQL + live MySQL)
         working-directory: packages/pyxle-db
@@ -73,6 +74,10 @@ jobs:
 
       - name: pyxle-auth tests (SQLite + live PostgreSQL + live MySQL)
         working-directory: packages/pyxle-auth
+        run: python -m pytest -q
+
+      - name: pyxle-mail tests (SMTP + Resend + Console; live SMTP skipped without a server)
+        working-directory: packages/pyxle-mail
         run: python -m pytest -q
 
       - name: No skipped live suites
@@ -98,4 +103,5 @@ jobs:
         run: |
           python -m build packages/pyxle-db
           python -m build packages/pyxle-auth
-          twine check packages/pyxle-db/dist/* packages/pyxle-auth/dist/*
+          python -m build packages/pyxle-mail
+          twine check packages/pyxle-db/dist/* packages/pyxle-auth/dist/* packages/pyxle-mail/dist/*
