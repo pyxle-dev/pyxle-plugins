@@ -1,0 +1,51 @@
+# No loader needed — useAuth().login talks to the framework's
+# POST /auth/login endpoint directly.
+
+
+# --- Client ---
+
+import React, { useState } from 'react';
+import { Link, navigate, useAuth } from 'pyxle/client';
+
+export default function Login() {
+  const { login, loading, error } = useAuth();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+
+  async function onSubmit(e) {
+    e.preventDefault();
+    const result = await login({ email, password });
+    if (result.ok) {
+      navigate('/dashboard');
+    }
+  }
+
+  return (
+    <main style={{ maxWidth: 360, margin: '3rem auto', fontFamily: 'system-ui' }}>
+      <h1>Sign in</h1>
+      <form onSubmit={onSubmit} style={{ display: 'grid', gap: 10 }}>
+        <input
+          type="email"
+          placeholder="you@example.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          required
+        />
+        <input
+          type="password"
+          placeholder="Password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          required
+        />
+        {error && <p role="alert" style={{ color: 'crimson' }}>{error}</p>}
+        <button type="submit" disabled={loading}>
+          {loading ? 'Signing in…' : 'Sign in'}
+        </button>
+      </form>
+      <p style={{ marginTop: 16 }}>
+        No account? <Link href="/register">Create one</Link>
+      </p>
+    </main>
+  );
+}

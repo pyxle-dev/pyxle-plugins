@@ -1,0 +1,12 @@
+{
+  "plugins": [
+    {
+      "name": "pyxle-db",
+      "settings": { "path": "./data/auth-app.db" }
+    },
+    {
+      "name": "pyxle-auth",
+      "settings": { "strict": false }
+    }
+  ]
+}

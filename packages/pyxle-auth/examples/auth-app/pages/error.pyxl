@@ -1,0 +1,16 @@
+# Error boundary — rendered when a loader raises (e.g. require_user_page's
+# 401 LoaderError for an anonymous visitor). Components only; no @server.
+
+import React from 'react';
+import { Link } from 'pyxle/client';
+
+export default function ErrorBoundary({ error }) {
+  const is401 = error && error.statusCode === 401;
+  return (
+    <main style={{ maxWidth: 420, margin: '3rem auto', fontFamily: 'system-ui' }}>
+      <h1>{is401 ? 'Please sign in' : 'Something went wrong'}</h1>
+      <p style={{ color: '#555' }}>{error && error.message}</p>
+      <Link href={is401 ? '/login' : '/'}>{is401 ? 'Go to sign in' : 'Go home'}</Link>
+    </main>
+  );
+}

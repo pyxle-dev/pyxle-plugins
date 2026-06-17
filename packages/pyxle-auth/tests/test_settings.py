@@ -99,6 +99,29 @@ def test_from_env_overrides_are_validated(
         )
 
 
+def test_auth_path_prefix_default() -> None:
+    assert AuthSettings().auth_path_prefix == "/auth"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["auth", "/auth/", "/", "", "auth/me"],
+    ids=["no-slash", "trailing-slash", "root-only", "empty", "relative"],
+)
+def test_auth_path_prefix_rejects_malformed(bad: str) -> None:
+    with pytest.raises(ValueError, match="auth_path_prefix"):
+        AuthSettings(auth_path_prefix=bad)
+
+
+def test_auth_path_prefix_accepts_nested() -> None:
+    assert AuthSettings(auth_path_prefix="/api/auth").auth_path_prefix == "/api/auth"
+
+
+def test_from_env_reads_auth_path_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYXLE_AUTH_PATH_PREFIX", "/account")
+    assert AuthSettings.from_env(strict=False).auth_path_prefix == "/account"
+
+
 def test_for_tests_relaxes_cost() -> None:
     s = AuthSettings().for_tests()
     assert s.argon_time_cost == 1

@@ -176,6 +176,10 @@ async def test_plugin_startup_accepts_any_db_database_service(
     user, cookie = await auth.sign_up(email="bob@example.com", password="correct horse")
     assert (await auth.resolve_session(cookie_value=cookie.value)).id == user.id
 
-    # The bundled migration ran against the foreign object.
+    # The bundled migrations ran against the foreign object, in order.
     applied = await contract_db.fetchall("SELECT id FROM schema_migrations_pyxle_auth")
-    assert [row["id"] for row in applied] == ["0001-pyxle-auth-core"]
+    assert [row["id"] for row in applied] == [
+        "0001-pyxle-auth-core",
+        "0002-oauth-identities",
+        "0003-jwt-refresh-tokens",
+    ]

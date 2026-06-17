@@ -38,13 +38,27 @@ __all__ = [
     "require_user_action",
     "require_permission_page",
     "require_permission_action",
+    "login_required",
+    "login_required_action",
+    "permission_required",
+    "permission_required_action",
     "bearer_token",
+    "bearer_user",
+    "authenticate",
     "PERMISSION_SERVICE_NAME",
     "AUTH_SERVICE_NAME",
+    "JWT_SERVICE_NAME",
+    "API_TOKEN_SERVICE_NAME",
 ]
 
 AUTH_SERVICE_NAME = "auth.service"
 PERMISSION_SERVICE_NAME = "auth.rbac"
+JWT_SERVICE_NAME = "auth.jwt"
+API_TOKEN_SERVICE_NAME = "auth.api_tokens"
+
+# Distinguishes "AuthSessionMiddleware cached an explicit None (anonymous)"
+# from "nothing has resolved this request's user yet".
+_UNSET: Any = object()
 
 
 class _SessionResolver(Protocol):
@@ -73,6 +87,13 @@ def _service_from_context(name: str) -> Any:
     return found
 
 
+def _optional_service(name: str) -> Any:
+    """Return a registered service, or ``None`` — for optional ones (JWT)."""
+    from pyxle.plugins import plugin
+
+    return plugin(name, None)
+
+
 async def current_user(
     request: Any, *, service: _SessionResolver | None = None, extend: bool = True
 ) -> User | None:
@@ -80,12 +101,33 @@ async def current_user(
 
     Reads the session cookie named by the service's settings and resolves
     it. Never raises on anonymous requests — branch on the result.
+
+    When :class:`~pyxle_auth.middleware.AuthSessionMiddleware` is active it has
+    already resolved this request's user and cached it on the ASGI scope (the
+    value behind Starlette's ``request.user``); the default call reuses that
+    instead of hitting the database again, and repeated guard calls within one
+    request resolve at most once. Passing an explicit ``service`` or
+    ``extend=False`` forces a fresh resolution and skips the cache.
     """
+    # Only the default ambient path participates in the per-request cache.
+    scope = (
+        getattr(request, "scope", None) if service is None and extend else None
+    )
+    if scope is not None:
+        cached = scope.get("user", _UNSET)
+        if cached is not _UNSET:
+            return cached
+
     svc = service if service is not None else _service_from_context(AUTH_SERVICE_NAME)
     cookie_value = request.cookies.get(svc.settings.cookie_name)
     if not cookie_value:
-        return None
-    return await svc.resolve_session(cookie_value=cookie_value, extend=extend)
+        user = None
+    else:
+        user = await svc.resolve_session(cookie_value=cookie_value, extend=extend)
+
+    if scope is not None:
+        scope["user"] = user
+    return user
 
 
 async def require_user_page(
@@ -197,3 +239,96 @@ def bearer_token(request: Any) -> str | None:
     if not token or len(token) > 256:
         return None
     return token
+
+
+async def bearer_user(
+    request: Any,
+    *,
+    auth: Any = None,
+    jwt: Any = None,
+    api_tokens: Any = None,
+    required_scope: str | None = None,
+) -> User | None:
+    """Resolve an ``Authorization: Bearer`` token to a user, or ``None``.
+
+    Tries a **JWT access token first, then a personal access token** — the
+    design's bearer order. The two never collide: a PAT (``pyxle_pat_…``) is
+    not a valid JWT, and a JWT is not a PAT. ``required_scope`` is enforced on
+    the PAT path. Returns ``None`` when there is no bearer header or it doesn't
+    validate; never raises on a bad token.
+
+    Services are read from the plugin context by default; pass them explicitly
+    in tests or hand-wired apps.
+    """
+    raw = bearer_token(request)
+    if raw is None:
+        return None
+    auth_svc = auth if auth is not None else _service_from_context(AUTH_SERVICE_NAME)
+
+    jwt_svc = jwt if jwt is not None else _optional_service(JWT_SERVICE_NAME)
+    if jwt_svc is not None:
+        claims = jwt_svc.verify_access(raw)
+        if claims is not None:
+            user = await auth_svc.get_user(user_id=claims["sub"])
+            if user is not None:
+                return user
+
+    pat_svc = (
+        api_tokens if api_tokens is not None else _optional_service(API_TOKEN_SERVICE_NAME)
+    )
+    if pat_svc is not None:
+        token = await pat_svc.resolve(raw_token=raw, required_scope=required_scope)
+        if token is not None:
+            return await auth_svc.get_user(user_id=token.user_id)
+
+    return None
+
+
+async def authenticate(
+    request: Any,
+    *,
+    service: _SessionResolver | None = None,
+    auth: Any = None,
+    jwt: Any = None,
+    api_tokens: Any = None,
+    required_scope: str | None = None,
+) -> User | None:
+    """The unified resolver: **session cookie → JWT bearer → PAT bearer**.
+
+    For endpoints that accept either a browser session or an API token. Returns
+    the user from the first method that validates, or ``None``. Branch on the
+    result, or wrap with :func:`require_user_action` semantics in your handler.
+    """
+    user = await current_user(request, service=service)
+    if user is not None:
+        return user
+    return await bearer_user(
+        request,
+        auth=auth,
+        jwt=jwt,
+        api_tokens=api_tokens,
+        required_scope=required_scope,
+    )
+
+
+# --- Roadmap-named aliases --------------------------------------------------
+#
+# The roadmap calls for a ``login_required`` guard. In Pyxle the idiomatic form
+# is an awaitable guard called at the top of a loader/action (a wrapping
+# decorator would violate the framework's "decorators add metadata, not
+# behaviour" rule), so these are thin, explicit aliases of the guards above —
+# not new behaviour. ``login_required`` guards a loader; the ``_action`` form
+# guards an action.
+
+#: Loader guard: require a signed-in user (alias of :func:`require_user_page`).
+login_required = require_user_page
+
+#: Action guard: require a signed-in user (alias of :func:`require_user_action`).
+login_required_action = require_user_action
+
+#: Loader guard: require a signed-in user holding a permission
+#: (alias of :func:`require_permission_page`).
+permission_required = require_permission_page
+
+#: Action guard: require a permission (alias of :func:`require_permission_action`).
+permission_required_action = require_permission_action
