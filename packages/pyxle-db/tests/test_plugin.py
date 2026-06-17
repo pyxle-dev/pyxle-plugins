@@ -222,3 +222,37 @@ async def test_get_database_shortcut_resolves_via_active_context(
     finally:
         set_active_context(None)
         await run_shutdown([plugin], ctx)
+
+
+async def test_orm_settings_register_engine_and_session_factory(tmp_path: Path) -> None:
+    spec = PluginSpec.from_config_entry(
+        {
+            "name": "pyxle-db",
+            "settings": {"path": "orm.db", "orm": {"pool": {"poolSize": 7}}},
+        }
+    )
+    [plugin] = load_plugins([spec])
+    ctx = PluginContext(settings=_FakeSettings(project_root=tmp_path))
+    await run_startup([plugin], ctx)
+    try:
+        from pyxle_db.orm import Engine
+
+        engine = ctx.require("db.orm.engine")
+        assert isinstance(engine, Engine)
+        assert ctx.has("db.orm.session_factory")
+        # The plugin still opened the explicit-SQL handle too.
+        assert ctx.has("db.database")
+    finally:
+        await run_shutdown([plugin], ctx)
+
+
+async def test_no_orm_settings_skips_engine(tmp_path: Path) -> None:
+    spec = PluginSpec.from_config_entry({"name": "pyxle-db", "settings": {"path": "x.db"}})
+    [plugin] = load_plugins([spec])
+    ctx = PluginContext(settings=_FakeSettings(project_root=tmp_path))
+    await run_startup([plugin], ctx)
+    try:
+        assert not ctx.has("db.orm.engine")
+        assert ctx.has("db.auto_transactions")
+    finally:
+        await run_shutdown([plugin], ctx)

@@ -28,6 +28,7 @@ Design constraints:
 
 from __future__ import annotations
 
+from pyxle_db.autotx import no_auto_transaction
 from pyxle_db.backends import Dialect
 from pyxle_db.contract import DatabaseLike, TransactionLike
 from pyxle_db.database import Database, Transaction, connect
@@ -90,6 +91,7 @@ __all__ = [
     "MigrationError",
     "MigrationChecksumMismatch",
     "get_database",
+    "no_auto_transaction",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

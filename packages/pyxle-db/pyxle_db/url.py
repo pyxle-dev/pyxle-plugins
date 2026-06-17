@@ -16,6 +16,7 @@ preserving the 0.1 ``Database("./data/app.db")`` behaviour exactly.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from pyxle_db.errors import ConfigurationError
@@ -60,6 +61,44 @@ class DatabaseConfig:
         if auth:
             auth += "@"
         return f"{self.backend}://{auth}{self.host}:{self.port}/{self.database}"
+
+    def sqlalchemy_url(self) -> Any:
+        """Build a SQLAlchemy async :class:`sqlalchemy.engine.URL` for this config.
+
+        Maps each backend to its async driver (``sqlite+aiosqlite``,
+        ``postgresql+asyncpg``, ``mysql+asyncmy``) and reuses the already-parsed
+        host/port/credentials/options. Requires the ``[sqlalchemy]`` extra — the
+        import is local so the base library never depends on SQLAlchemy.
+        """
+        from sqlalchemy.engine import URL  # noqa: PLC0415 - optional extra
+
+        if self.backend == "sqlite":
+            # aiosqlite carries the file path as the database; an in-memory DB
+            # has no database component.
+            database = None if self.path == ":memory:" else self.path
+            return URL.create("sqlite+aiosqlite", database=database)
+
+        driver = _ASYNC_DRIVERS.get(self.backend)
+        if driver is None:  # pragma: no cover - parse_database_url guards backends
+            raise ConfigurationError(
+                f"No async SQLAlchemy driver is configured for backend {self.backend!r}."
+            )
+        return URL.create(
+            driver,
+            username=self.user or None,
+            password=self.password or None,
+            host=self.host or None,
+            port=self.port or None,
+            database=self.database or None,
+            query=dict(self.options),
+        )
+
+
+#: SQLAlchemy async driver per server backend (SQLite is handled inline).
+_ASYNC_DRIVERS = {
+    "postgresql": "postgresql+asyncpg",
+    "mysql": "mysql+asyncmy",
+}
 
 
 def parse_database_url(url_or_path: str) -> DatabaseConfig:

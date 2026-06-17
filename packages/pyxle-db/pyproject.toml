@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-db"
-version = "0.2.0"
+version = "0.3.0"
 description = "Database plugin for Pyxle: SQLite, PostgreSQL, and MySQL with one explicit-SQL API, portable qmark placeholders, and checksum-tracked migrations."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,6 +30,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+sqlalchemy = [
+  "sqlalchemy[asyncio]>=2.0,<3.0",
+  "alembic>=1.13,<2.0",
+  # The async SQLAlchemy SQLite driver. The explicit-SQL path still uses the
+  # stdlib sqlite3 module, so this is only needed for the ORM path.
+  "aiosqlite>=0.19",
+]
 postgres = [
   "asyncpg>=0.29",
 ]
@@ -48,6 +55,9 @@ dev = [
 Homepage = "https://pyxle.dev"
 Source = "https://github.com/pyxle-dev/pyxle-plugins"
 Changelog = "https://github.com/pyxle-dev/pyxle-plugins/blob/main/packages/pyxle-db/CHANGELOG.md"
+
+[project.scripts]
+pyxle-db = "pyxle_db.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["pyxle_db"]
