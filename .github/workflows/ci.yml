@@ -64,7 +64,7 @@ jobs:
 
       - name: Install packages with all extras
         run: |
-          pip install -e "packages/pyxle-db[postgres,mysql,dev]"
+          pip install -e "packages/pyxle-db[sqlalchemy,postgres,mysql,dev]"
           pip install -e "packages/pyxle-auth[dev]"
           pip install -e "packages/pyxle-mail[resend,dev]"
 
