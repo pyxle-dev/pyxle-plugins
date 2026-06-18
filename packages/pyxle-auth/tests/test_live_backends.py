@@ -39,13 +39,19 @@ POSTGRES_URL = os.environ.get("PYXLE_DB_TEST_POSTGRES_URL", "")
 MYSQL_URL = os.environ.get("PYXLE_DB_TEST_MYSQL_URL", "")
 
 # Reverse-dependency order so engines that enforce foreign keys on DROP
-# (MySQL) accept it.
+# (MySQL) accept it. Every table any migration or ensure_schema() creates must
+# be listed: a table left behind leaks into the next test — on PostgreSQL its
+# FK back to ``users`` blocks the ``users`` drop ("dependent objects still
+# exist"), and on MySQL its surviving index makes the next run's bare
+# ``CREATE INDEX`` fail with "Duplicate key name".
 _ALL_TABLES = (
     "user_roles",
     "roles",
     "api_tokens",
     "auth_tokens",
     "ratelimit_buckets",
+    "oauth_identities",
+    "jwt_refresh_tokens",
     "sessions",
     "users",
     "schema_migrations_pyxle_auth",
@@ -101,8 +107,14 @@ async def test_schema_applies_and_is_idempotent(live_db: Database, services) -> 
     ensure_schema — must run twice without drift on a live engine."""
     await _apply_schema(live_db, services)
     await _apply_schema(live_db, services)  # rerun = restart; must be a no-op
-    applied = await live_db.fetchall("SELECT id FROM schema_migrations_pyxle_auth")
-    assert [row["id"] for row in applied] == ["0001-pyxle-auth-core"]
+    applied = await live_db.fetchall(
+        "SELECT id FROM schema_migrations_pyxle_auth ORDER BY id"
+    )
+    assert [row["id"] for row in applied] == [
+        "0001-pyxle-auth-core",
+        "0002-oauth-identities",
+        "0003-jwt-refresh-tokens",
+    ]
 
 
 async def test_full_account_lifecycle(live_db: Database, services) -> None:  # type: ignore[no-untyped-def]
