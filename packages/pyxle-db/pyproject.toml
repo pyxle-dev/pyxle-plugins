@@ -65,3 +65,9 @@ packages = ["pyxle_db"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+# The dialect-specific backend tests guard their imports behind
+# `pytest.importorskip("asyncpg"/"asyncmy")`, so those imports are deliberately
+# below the call — E402 is expected and correct here.
+"tests/test_backend_*.py" = ["E402"]

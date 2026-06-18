@@ -13,7 +13,10 @@ Enterprise database support. All additive — no breaking changes.
 
 - **Request-scoped database injection.** With the plugin installed, every loader
   and action gets a lazy database handle on `request.state.db` — no import, no
-  service lookup. A request that never queries opens no connection.
+  service lookup. A request that never queries opens no connection. The injecting
+  middleware is **pure-ASGI** (not `BaseHTTPMiddleware`), so it never buffers the
+  response — it works with streaming-SSR (`<Suspense>`) pages and never raises
+  `No response returned` on a mid-stream client disconnect.
 - **Automatic transactions.** An unsafe-method request (POST/PUT/PATCH/DELETE)
   runs its writes in one transaction that commits when the action succeeds and
   rolls back when it fails. Because Pyxle's dispatcher catches an action's

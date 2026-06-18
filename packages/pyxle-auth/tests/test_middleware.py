@@ -1,16 +1,25 @@
 """Tests for AuthSessionMiddleware — request.user injection + /me + /logout.
 
-The middleware is driven directly (``await mw.dispatch(request, call_next)``)
-rather than through a TestClient, so the async SQLite connection the
-:class:`AuthService` holds and the handler run on the *same* event loop —
-TestClient spins its own loop, which aiosqlite connections are bound to (the
-same constraint pyxle-db's middleware tests document).
+``AuthSessionMiddleware`` is a pure-ASGI app, driven here through a tiny
+in-process ASGI harness (``_DriveMiddleware`` + ``_drive``) rather than a
+TestClient, so the async SQLite connection the :class:`AuthService` holds and
+the handler run on the *same* event loop — TestClient spins its own loop, which
+aiosqlite connections are bound to (the same constraint pyxle-db's middleware
+tests document).
+
+The harness mirrors pyxle-db's ``_drive``: it wraps a ``(request) -> Response``
+handler as the inner ASGI app, drives ``AuthSessionMiddleware(inner)`` against a
+built scope, and captures the response the middleware emits (status, headers,
+body) so the assertions read like the dispatcher's real behaviour. A request
+the middleware passes *through* runs the inner handler (ambient population); a
+request it *terminates* (an auth endpoint) never reaches the inner handler.
 """
 
 from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from typing import Any, Awaitable, Callable
 
 import pytest
 from starlette.requests import Request
@@ -21,14 +30,73 @@ from pyxle.plugins import PluginContext
 from pyxle_auth import AuthService
 from pyxle_auth.middleware import AuthSessionMiddleware, user_to_json
 
+Handler = Callable[[Request], Awaitable[Response]]
 
-async def _dummy_asgi(scope, receive, send):  # pragma: no cover - never called
-    raise AssertionError("dispatch is invoked directly in tests")
+
+class _CapturedResponse:
+    """The response the middleware emitted onto the ASGI ``send`` channel.
+
+    Exposes just the surface the assertions read off a Starlette ``Response``:
+    ``status_code``, a case-insensitive ``headers`` mapping, ``raw_headers``
+    (list of ``(bytes, bytes)`` — multiple ``set-cookie`` rows preserved), and
+    the joined ``body`` as ``bytes``.
+    """
+
+    def __init__(
+        self, status: int, raw_headers: list[tuple[bytes, bytes]], body: bytes
+    ) -> None:
+        self.status_code = status
+        self.raw_headers = raw_headers
+        self.body = body
+
+    @property
+    def headers(self) -> dict[str, str]:
+        # Last value wins for a repeated header (matches Starlette's single-value
+        # access); the tests that need every set-cookie use raw_headers.
+        return {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in self.raw_headers
+        }
+
+
+class _DriveMiddleware:
+    """Drives a request through ``AuthSessionMiddleware`` as pure ASGI.
+
+    ``dispatch(request, call_next)`` keeps the call sites identical to the old
+    ``BaseHTTPMiddleware`` interface: it wraps ``call_next`` as the inner ASGI
+    app, runs ``AuthSessionMiddleware(inner)`` against the request's own
+    scope/receive, and returns the captured response. The ``request``'s scope is
+    shared, so assertions on ``request.user`` / ``request.scope[...]`` populated
+    by the middleware still hold afterwards.
+    """
+
+    async def dispatch(self, request: Request, call_next: Handler) -> _CapturedResponse:
+        scope = request.scope
+        receive = request.receive
+
+        async def inner(scope: dict, receive: Any, send: Any) -> None:
+            inner_request = Request(scope, receive)
+            response = await call_next(inner_request)
+            await response(scope, receive, send)
+
+        captured: dict[str, Any] = {"status": 0, "headers": [], "body": b""}
+
+        async def send(message: dict) -> None:
+            if message["type"] == "http.response.start":
+                captured["status"] = message["status"]
+                captured["headers"] = list(message.get("headers", []))
+            elif message["type"] == "http.response.body":
+                captured["body"] += message.get("body", b"")
+
+        await AuthSessionMiddleware(inner)(scope, receive, send)
+        return _CapturedResponse(
+            captured["status"], captured["headers"], captured["body"]
+        )
 
 
 @pytest.fixture
-def middleware() -> AuthSessionMiddleware:
-    return AuthSessionMiddleware(_dummy_asgi)
+def middleware() -> _DriveMiddleware:
+    return _DriveMiddleware()
 
 
 def _ctx(auth: AuthService | None) -> PluginContext:
@@ -50,6 +118,10 @@ def _request(
         blob = "; ".join(f"{k}={v}" for k, v in cookies.items())
         headers.append((b"cookie", blob.encode("latin-1")))
     app = SimpleNamespace(state=SimpleNamespace(pyxle_plugins=ctx))
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
     scope = {
         "type": "http",
         "method": method,
@@ -59,7 +131,7 @@ def _request(
         "app": app,
         "state": {},
     }
-    return Request(scope)
+    return Request(scope, receive)
 
 
 async def _sign_up(auth: AuthService) -> tuple[str, str]:
@@ -73,7 +145,7 @@ async def _sign_up(auth: AuthService) -> tuple[str, str]:
     return user.id, cookie.value
 
 
-def _body(response: Response) -> dict:
+def _body(response: _CapturedResponse) -> dict:
     return json.loads(bytes(response.body).decode("utf-8"))
 
 
@@ -82,7 +154,7 @@ def _body(response: Response) -> dict:
 
 
 async def test_anonymous_request_sets_user_none_without_db(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
     captured: dict = {}
@@ -97,7 +169,7 @@ async def test_anonymous_request_sets_user_none_without_db(
 
 
 async def test_valid_cookie_populates_request_user(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     user_id, cookie = await _sign_up(auth)
     ctx = _ctx(auth)
@@ -117,7 +189,7 @@ async def test_valid_cookie_populates_request_user(
 
 
 async def test_forged_cookie_resolves_to_none(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
     captured: dict = {}
@@ -134,17 +206,19 @@ async def test_forged_cookie_resolves_to_none(
 
 
 async def test_no_auth_service_passes_through(
-    middleware: AuthSessionMiddleware,
+    middleware: _DriveMiddleware,
 ) -> None:
     ctx = _ctx(None)  # auth.service not registered
+    captured: dict = {}
 
     async def call_next(request: Request) -> Response:
         # No service → middleware must not touch the scope's user slot.
-        assert "user" not in request.scope
+        captured["has_user"] = "user" in request.scope
         return JSONResponse({"ok": True})
 
     resp = await middleware.dispatch(_request(ctx, path="/anything"), call_next)
     assert resp.status_code == 200
+    assert captured["has_user"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +226,7 @@ async def test_no_auth_service_passes_through(
 
 
 async def test_me_anonymous_returns_null_user(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
 
@@ -165,7 +239,7 @@ async def test_me_anonymous_returns_null_user(
 
 
 async def test_me_signed_in_returns_user_projection(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     user_id, cookie = await _sign_up(auth)
     ctx = _ctx(auth)
@@ -190,7 +264,7 @@ async def test_me_signed_in_returns_user_projection(
 
 
 async def test_me_rejects_post(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
 
@@ -209,7 +283,7 @@ async def test_me_rejects_post(
 
 
 async def test_logout_revokes_session_and_clears_cookie(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     _, cookie = await _sign_up(auth)
     ctx = _ctx(auth)
@@ -236,7 +310,7 @@ async def test_logout_revokes_session_and_clears_cookie(
 
 
 async def test_logout_is_idempotent_when_anonymous(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
 
@@ -251,7 +325,7 @@ async def test_logout_is_idempotent_when_anonymous(
 
 
 async def test_logout_rejects_get(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
 
@@ -294,7 +368,7 @@ def _request_json(
 
 
 async def test_signup_creates_account_and_sets_cookie(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
 
@@ -322,7 +396,7 @@ async def test_signup_creates_account_and_sets_cookie(
 
 
 async def test_login_succeeds_with_valid_credentials(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     await _sign_up(auth)
     ctx = _ctx(auth)
@@ -347,7 +421,7 @@ async def test_login_succeeds_with_valid_credentials(
 
 
 async def test_login_wrong_password_is_401(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     await _sign_up(auth)
     ctx = _ctx(auth)
@@ -372,7 +446,7 @@ async def test_login_wrong_password_is_401(
 
 
 async def test_login_unknown_email_is_401_same_as_wrong_password(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
 
@@ -392,7 +466,7 @@ async def test_login_unknown_email_is_401_same_as_wrong_password(
 
 
 async def test_signup_duplicate_email_is_409(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     await _sign_up(auth)
     ctx = _ctx(auth)
@@ -413,7 +487,7 @@ async def test_signup_duplicate_email_is_409(
 
 
 async def test_signup_weak_password_is_422(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
 
@@ -433,7 +507,7 @@ async def test_signup_weak_password_is_422(
 
 
 async def test_login_missing_fields_is_400(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
 
@@ -449,7 +523,7 @@ async def test_login_missing_fields_is_400(
 
 
 async def test_credentials_api_can_be_disabled(
-    db, settings, middleware: AuthSessionMiddleware
+    db, settings, middleware: _DriveMiddleware
 ) -> None:
     from dataclasses import replace
 
@@ -490,7 +564,7 @@ async def _ctx_with_jwt(auth: AuthService):
 
 
 async def test_token_endpoint_issues_pair(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     await _sign_up(auth)
     ctx, jwt = await _ctx_with_jwt(auth)
@@ -519,7 +593,7 @@ async def test_token_endpoint_issues_pair(
 
 
 async def test_token_endpoint_wrong_password_is_401(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     await _sign_up(auth)
     ctx, _ = await _ctx_with_jwt(auth)
@@ -540,7 +614,7 @@ async def test_token_endpoint_wrong_password_is_401(
 
 
 async def test_token_refresh_rotates(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     user, _ = await auth.sign_up(email="rot@example.com", password="correct horse staple")
     ctx, jwt = await _ctx_with_jwt(auth)
@@ -562,7 +636,7 @@ async def test_token_refresh_rotates(
 
 
 async def test_token_refresh_invalid_is_401(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx, _ = await _ctx_with_jwt(auth)
 
@@ -578,7 +652,7 @@ async def test_token_refresh_invalid_is_401(
 
 
 async def test_token_endpoint_absent_when_jwt_not_configured(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     # No auth.jwt registered → /token is not an owned endpoint, falls through.
     ctx = _ctx(auth)
@@ -601,7 +675,7 @@ async def test_token_endpoint_absent_when_jwt_not_configured(
 
 
 async def test_scope_seed_anonymous(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     ctx = _ctx(auth)
     captured: dict = {}
@@ -620,7 +694,7 @@ async def test_scope_seed_anonymous(
 
 
 async def test_scope_seed_signed_in(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     _, cookie = await _sign_up(auth)
     ctx = _ctx(auth)
@@ -638,7 +712,7 @@ async def test_scope_seed_signed_in(
 
 
 async def test_scope_seed_omits_credentials_endpoints_when_disabled(
-    db, settings, middleware: AuthSessionMiddleware
+    db, settings, middleware: _DriveMiddleware
 ) -> None:
     from dataclasses import replace
 
@@ -664,7 +738,7 @@ async def test_scope_seed_omits_credentials_endpoints_when_disabled(
 
 
 async def test_custom_prefix_moves_endpoints(
-    db, settings, middleware: AuthSessionMiddleware
+    db, settings, middleware: _DriveMiddleware
 ) -> None:
     from dataclasses import replace
 
@@ -697,7 +771,7 @@ async def test_custom_prefix_moves_endpoints(
 
 
 async def test_guard_reuses_request_user_from_middleware(
-    auth: AuthService, middleware: AuthSessionMiddleware
+    auth: AuthService, middleware: _DriveMiddleware
 ) -> None:
     """A guarded loader running after the middleware must not re-resolve."""
     from pyxle_auth.guards import current_user

@@ -27,10 +27,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable
 
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from pyxle_db.autotx import MANUAL_FLAG
 from pyxle_db.contract import DatabaseLike, TransactionLike
@@ -167,19 +165,45 @@ class _SqlHandleProxy:
         return self._uow._db.dialect
 
 
-class PyxleDbMiddleware(BaseHTTPMiddleware):
-    """Inject ``request.state.db`` and manage the per-request transaction."""
+class PyxleDbMiddleware:
+    """Inject ``request.state.db`` and manage the per-request transaction.
+
+    Implemented as a **pure-ASGI** middleware (not ``BaseHTTPMiddleware``) so it
+    does not buffer the response. ``BaseHTTPMiddleware`` materialises the whole
+    response before returning, which defeats streaming SSR (a streamed page would
+    arrive all at once) and surfaces a mid-stream client disconnect as
+    ``RuntimeError: No response returned``. Here we forward every ASGI body chunk
+    straight through, capture the final status from the ``http.response.start``
+    message, and commit or roll back once the response has been fully sent —
+    preserving the same "commit on 2xx/3xx, roll back otherwise" contract.
+
+    A streamed response that was **truncated by a mid-stream client disconnect**
+    returns from the app normally (Starlette/anyio swallow the disconnect
+    cancellation) with its 2xx status already captured, but its final body frame
+    never arrives — so we treat an incomplete response as failed and roll back,
+    rather than committing the partial work of a render the client never received.
+    """
 
     def __init__(self, app: ASGIApp) -> None:
-        super().__init__(app)
+        self.app = app
 
-    async def dispatch(self, request: Request, call_next: Any) -> Response:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # A scope-bound Request shares ``scope["state"]`` with the downstream
+        # handler, so anything we put on ``request.state`` is what loaders/actions
+        # read. We never consume the request body here (no ``receive``), so the
+        # handler still reads it from the original ``receive`` channel.
+        request = Request(scope)
         ctx = getattr(request.app.state, "pyxle_plugins", None)
         database = ctx.get(_DATABASE_SERVICE) if ctx is not None else None
         session_factory = ctx.get(_SESSION_FACTORY_SERVICE) if ctx is not None else None
         if database is None and session_factory is None:
             # Plugin registered middleware but nothing to inject — pass through.
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
         auto_commit = self._auto_commit_enabled(request, ctx)
 
@@ -194,11 +218,27 @@ class PyxleDbMiddleware(BaseHTTPMiddleware):
         if session is not None:
             request.state.session = session
 
+        # The body may still stream after the start message, so we record the
+        # status now and decide commit-vs-rollback only after the app completes.
+        # ``response_complete`` tracks whether the terminal body frame was sent —
+        # a stream truncated mid-flight by a disconnect never sends it.
+        status_code = 500
+        response_complete = False
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal status_code, response_complete
+            message_type = message["type"]
+            if message_type == "http.response.start":
+                status_code = message["status"]
+            elif message_type == "http.response.body" and not message.get("more_body", False):
+                response_complete = True
+            await send(message)
+
         try:
-            response = await call_next(request)
+            await self.app(scope, receive, send_wrapper)
         except BaseException:
-            # A genuine ASGI-level escape (rare — loaders are caught by the
-            # error boundary). Discard any open work before re-raising.
+            # A genuine ASGI-level escape (a handler that raised). Discard any
+            # open work before re-raising.
             if uow is not None:
                 await uow.rollback()
             if session is not None:
@@ -206,18 +246,31 @@ class PyxleDbMiddleware(BaseHTTPMiddleware):
             raise
 
         manual = getattr(request.state, MANUAL_FLAG, False)
-        ok = 200 <= response.status_code < 400
+        # Commit only a SUCCESSFUL, COMPLETED response. A 2xx whose body was cut
+        # short by a mid-stream disconnect (``response_complete`` is False)
+        # discards its partial writes, like an outright failure.
+        ok = 200 <= status_code < 400 and response_complete
 
-        if uow is not None and uow.opened:
-            # Commit on success; a failed action (ok:false ⇒ 4xx/5xx) discards
-            # its partial writes.
-            if ok:
-                await uow.commit()
-            else:
-                await uow.rollback()
-        if session is not None:
-            await _finalize_session(session, auto=(auto_commit and not manual), ok=ok)
-        return response
+        # The response is already fully sent, so a commit/rollback failure here
+        # (deferred constraint, serialization conflict, dropped connection, …)
+        # cannot change the client's outcome — log it rather than let it escape as
+        # an unhandled ASGI error, and always finalize the ORM session so it is
+        # not leaked.
+        try:
+            if uow is not None and uow.opened:
+                if ok:
+                    await uow.commit()
+                else:
+                    await uow.rollback()
+        except Exception:
+            _logger.exception(
+                "pyxle-db: commit/rollback failed after the response was sent "
+                "(status=%s); the write may not have persisted",
+                status_code,
+            )
+        finally:
+            if session is not None:
+                await _finalize_session(session, auto=(auto_commit and not manual), ok=ok)
 
     @staticmethod
     def _auto_commit_enabled(request: Request, ctx: Any) -> bool:

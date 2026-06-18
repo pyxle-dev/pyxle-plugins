@@ -41,10 +41,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from pyxle_auth.errors import (
     AccountExists,
@@ -85,20 +84,44 @@ def user_to_json(user: Any) -> dict[str, Any] | None:
     }
 
 
-class AuthSessionMiddleware(BaseHTTPMiddleware):
-    """Populate ``request.user`` and serve the auth HTTP endpoints."""
+class AuthSessionMiddleware:
+    """Populate ``request.user`` and serve the auth HTTP endpoints.
+
+    Pure-ASGI (not ``BaseHTTPMiddleware``): the ambient path forwards the request
+    untouched so it never buffers the response — buffering would break streaming
+    SSR (a streamed page would arrive all at once, and a mid-stream client
+    disconnect would surface as ``RuntimeError: No response returned``). The auth
+    endpoints still terminate the request with a JSON response.
+    """
 
     def __init__(self, app: ASGIApp) -> None:
-        super().__init__(app)
+        self.app = app
 
-    async def dispatch(self, request: Request, call_next: Any) -> Response:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope, receive)
         ctx = getattr(request.app.state, "pyxle_plugins", None)
         service = ctx.get(_AUTH_SERVICE) if ctx is not None else None
         if service is None:
-            # Middleware installed but no auth service registered — pass through
-            # without touching request.user (matches PyxleDbMiddleware's seam).
-            return await call_next(request)
+            # Middleware installed but no auth service registered — pass through.
+            await self.app(scope, receive, send)
+            return
 
+        response = await self._handle(request, ctx, service)
+        if response is not None:
+            # An auth endpoint terminated the request.
+            await response(scope, receive, send)
+            return
+
+        # Ambient: request.user / scope['pyxle.auth'] are populated; stream on.
+        await self.app(scope, receive, send)
+
+    async def _handle(self, request: Request, ctx: Any, service: Any) -> Response | None:
+        """Serve an auth endpoint (returns a Response) or populate ``request.user``
+        and return ``None`` to signal the request should pass through."""
         settings = service.settings
         prefix = settings.auth_path_prefix
         path = request.url.path
@@ -137,7 +160,7 @@ class AuthSessionMiddleware(BaseHTTPMiddleware):
         # Ambient population for every other request: loaders, actions, and
         # templates read request.user; the SSR document reads scope['pyxle.auth'].
         await self._populate(request, service, settings)
-        return await call_next(request)
+        return None
 
     @staticmethod
     async def _populate(request: Request, service: Any, settings: Any) -> Any:

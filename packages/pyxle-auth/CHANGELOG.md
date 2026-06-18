@@ -21,7 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A request without the session cookie does zero database work; one that
   carries it performs a single indexed lookup, and the guards reuse that
   resolved value (cached on the request) so a guarded loader never
-  resolves the session twice.
+  resolves the session twice. Both this middleware and the OAuth
+  middleware are **pure-ASGI** (not `BaseHTTPMiddleware`): the pass-through
+  path forwards the response untouched, so they work with streaming-SSR
+  (`<Suspense>`) pages and never raise `No response returned` on a
+  mid-stream client disconnect.
 - **Credentials API** — `POST {prefix}/login` and `POST {prefix}/signup`
   (email + password), gated by `enableCredentialsApi` (default on). They
   reuse the hardened `AuthService.sign_in` / `sign_up` (per-IP and

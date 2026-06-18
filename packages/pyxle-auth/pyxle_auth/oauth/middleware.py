@@ -26,10 +26,9 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from pyxle_auth.oauth import state as oauth_state
 from pyxle_auth.oauth.errors import (
@@ -63,34 +62,49 @@ class OAuthFlowConfig:
     default_next: str = "/"
 
 
-class OAuthMiddleware(BaseHTTPMiddleware):
+class OAuthMiddleware:
     """Serve ``{prefix}/oauth/{provider}/{start,callback}``; pass everything
-    else through."""
+    else through.
+
+    Pure-ASGI (not ``BaseHTTPMiddleware``) so the pass-through path forwards the
+    request untouched and never buffers a streamed response. OAuth requests are
+    always terminated here with a redirect, so they never stream.
+    """
 
     def __init__(self, app: ASGIApp) -> None:
-        super().__init__(app)
+        self.app = app
 
-    async def dispatch(self, request: Request, call_next: Any) -> Response:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        response = await self._handle(Request(scope, receive))
+        if response is not None:
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+    async def _handle(self, request: Request) -> Response | None:
+        """Return a Response for an OAuth endpoint, or ``None`` to pass through."""
         ctx = getattr(request.app.state, "pyxle_plugins", None)
         service = ctx.get(_OAUTH_SERVICE) if ctx is not None else None
         config: OAuthFlowConfig | None = (
             ctx.get(_OAUTH_CONFIG) if ctx is not None else None
         )
         if service is None or config is None:
-            # OAuth not configured — inert.
-            return await call_next(request)
+            return None  # OAuth not configured — inert.
 
         oauth_base = config.auth_path_prefix + "/oauth"
         path = request.url.path
         if not path.startswith(oauth_base + "/"):
-            return await call_next(request)
+            return None
 
         parts = path[len(oauth_base) + 1 :].split("/")
         if len(parts) != 2:
-            return await call_next(request)
+            return None
         provider_name, action = parts
         if action not in ("start", "callback"):
-            return await call_next(request)
+            return None
         if request.method != "GET":
             return JSONResponse(
                 {"ok": False, "error": "Method not allowed"},
