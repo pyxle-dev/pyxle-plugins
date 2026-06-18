@@ -62,7 +62,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from pyxle.plugins import PluginContext, PyxlePlugin
 
@@ -78,7 +78,15 @@ _ENV_PREFIX = "env:"
 
 class PyxleDbPlugin(PyxlePlugin):
     name = "pyxle-db"
-    version = "0.2.0"
+    version = "0.3.0"
+
+    def middleware(self) -> Sequence[tuple[str, Mapping[str, Any]]]:
+        """Inject ``request.state.db`` and manage per-request transactions.
+
+        Runs for every request before loaders and actions. See
+        :class:`pyxle_db.middleware.PyxleDbMiddleware`.
+        """
+        return [("pyxle_db.middleware:PyxleDbMiddleware", {})]
 
     async def on_startup(self, ctx: PluginContext) -> None:
         settings = dict(self.settings or {})
@@ -106,6 +114,20 @@ class PyxleDbPlugin(PyxlePlugin):
         redacted_url = database.config.redacted()
         ctx.register("db.database", database)
         ctx.register("db.url", redacted_url)
+        # Whether the request middleware auto-commits a transaction for unsafe
+        # methods. Default on; set "autoTransactions": false to manage every
+        # transaction by hand.
+        ctx.register(
+            "db.auto_transactions",
+            bool(settings.get("autoTransactions", True)),
+        )
+
+        # Optional SQLAlchemy ORM path: when "orm" is configured, build a
+        # process-wide async engine + session factory against the same database
+        # and register them. The middleware then injects request.state.session.
+        orm_settings = settings.get("orm")
+        if orm_settings is not None:
+            await self._start_orm(ctx, database, orm_settings)
         if database.config.backend == "sqlite":
             # 0.1 back-compat: SQLite consumers (backup scripts, the
             # devserver's diagnostics page) read the file path directly.
@@ -117,7 +139,36 @@ class PyxleDbPlugin(PyxlePlugin):
             f" (migrations from {migrations_dir})" if migrations_dir else "",
         )
 
+    async def _start_orm(
+        self, ctx: PluginContext, database: Database, orm_settings: Any
+    ) -> None:
+        """Build and register the SQLAlchemy async engine + session factory.
+
+        Reuses the database's parsed config so the ORM connects to the same
+        place the explicit-SQL handle does. Requires the ``[sqlalchemy]`` extra
+        — a missing extra raises a clear ``ConfigurationError`` from the import.
+        """
+        from pyxle_db.orm import Engine, PoolConfig  # noqa: PLC0415 - optional extra
+
+        pool_settings = (
+            orm_settings.get("pool") if isinstance(orm_settings, Mapping) else None
+        )
+        engine = Engine.from_config(
+            database.config, pool=PoolConfig.from_settings(pool_settings)
+        )
+        await engine.connect()  # verify connectivity at startup, not first request
+        ctx.register("db.orm.engine", engine)
+        ctx.register("db.orm.session_factory", engine.session_factory)
+        _logger.info("pyxle-db: SQLAlchemy ORM engine ready")
+
     async def on_shutdown(self, ctx: PluginContext) -> None:
+        engine = ctx.get("db.orm.engine")
+        if engine is not None:
+            try:
+                await engine.aclose()
+            except Exception:  # pragma: no cover - best-effort
+                _logger.exception("pyxle-db: ORM engine aclose() failed during shutdown")
+
         database = ctx.get("db.database")
         if database is None:
             return

@@ -5,6 +5,38 @@ All notable changes to `pyxle-db` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-06-17
+
+Enterprise database support. All additive — no breaking changes.
+
+### Added
+
+- **Request-scoped database injection.** With the plugin installed, every loader
+  and action gets a lazy database handle on `request.state.db` — no import, no
+  service lookup. A request that never queries opens no connection. The injecting
+  middleware is **pure-ASGI** (not `BaseHTTPMiddleware`), so it never buffers the
+  response — it works with streaming-SSR (`<Suspense>`) pages and never raises
+  `No response returned` on a mid-stream client disconnect.
+- **Automatic transactions.** An unsafe-method request (POST/PUT/PATCH/DELETE)
+  runs its writes in one transaction that commits when the action succeeds and
+  rolls back when it fails. Because Pyxle's dispatcher catches an action's
+  exception and returns a non-2xx response (the exception never escapes),
+  commit/rollback is keyed on the response status, not on an escaping exception —
+  so a failed action never commits a partial write. Opt out per action with the
+  `@no_auto_transaction` decorator, or app-wide with `"autoTransactions": false`.
+- **SQLAlchemy ORM path** (optional `[sqlalchemy]` extra). `pyxle_db.orm` adds an
+  async `Engine` + `async_sessionmaker`, a `Base` declarative base, request-scoped
+  `request.state.session` (same auto-transaction rules), connection pooling
+  (`orm.pool`, `pool_pre_ping` on by default), and `get_session()` for work
+  outside a request. SQLAlchemy errors are translated to the same `pyxle_db`
+  error types as the explicit-SQL path. The base install stays SQLAlchemy-free.
+- **`pyxle-db` CLI.** `pyxle-db migrate` / `migrate --dry-run` / `status` drive
+  the checksum migrator; `alembic-init` / `revision --autogenerate` / `upgrade` /
+  `downgrade` / `current` / `history` drive Alembic for the ORM path. The CLI
+  reads the app's own `pyxle.config.json` + `.env`. Also `python -m pyxle_db.cli`.
+- `Migrator.status()` returning a `MigrationStatus` (applied vs pending).
+- `DatabaseConfig.sqlalchemy_url()` building the async SQLAlchemy URL.
+
 ## [0.2.0] - 2026-06-11
 
 ### Changed (BREAKING)

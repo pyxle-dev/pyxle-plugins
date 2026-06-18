@@ -74,6 +74,20 @@ class FakeAuthService:
         return self._sessions.get(cookie_value)
 
 
+class FakeScopeRequest(FakeRequest):
+    """A FakeRequest that also carries an ASGI-style ``scope`` dict, so the
+    guard's per-request ``request.user`` cache (``scope['user']``) is
+    exercised the way a real Starlette request exercises it."""
+
+    def __init__(
+        self,
+        cookies: Mapping[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(cookies, headers)
+        self.scope: dict[str, Any] = {}
+
+
 class FakeRbac:
     """Permission checker with a fixed grant set; records every call."""
 
@@ -145,6 +159,56 @@ async def test_current_user_with_unknown_cookie_is_none(
 ) -> None:
     request = FakeRequest(cookies={COOKIE_NAME: "forged-cookie"})
     assert await current_user(request, service=auth) is None
+
+
+# ---------------------------------------------------------------------------
+# Per-request request.user cache (the AuthSessionMiddleware contract)
+
+
+async def test_current_user_reuses_scope_cache(
+    user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # When AuthSessionMiddleware has cached request.user on the scope, the
+    # default guard returns it WITHOUT consulting the service or the DB.
+    def exploding_plugin(name: str, default: Any = None) -> Any:
+        raise AssertionError("service consulted despite a cached request.user")
+
+    monkeypatch.setattr(pyxle.plugins, "plugin", exploding_plugin)
+    request = FakeScopeRequest(cookies={COOKIE_NAME: "valid-cookie"})
+    request.scope["user"] = user
+    assert await current_user(request) is user
+
+
+async def test_current_user_caches_resolution_on_scope(
+    auth: FakeAuthService, user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # First resolve populates scope['user']; a second default call reuses it,
+    # so the session is resolved at most once per request.
+    registry = {AUTH_SERVICE_NAME: auth}
+    monkeypatch.setattr(
+        pyxle.plugins, "plugin", lambda name, default=None: registry.get(name)
+    )
+    request = FakeScopeRequest(cookies={COOKIE_NAME: "valid-cookie"})
+    assert await current_user(request) is user
+    assert await current_user(request) is user
+    assert auth.calls == [("valid-cookie", True)]  # exactly one DB round-trip
+    assert request.scope["user"] is user
+
+
+async def test_current_user_extend_false_bypasses_scope_cache(
+    auth: FakeAuthService, user: User, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # extend=False is an explicit "resolve fresh, don't slide" — it must ignore
+    # any cached value and not write one back.
+    registry = {AUTH_SERVICE_NAME: auth}
+    monkeypatch.setattr(
+        pyxle.plugins, "plugin", lambda name, default=None: registry.get(name)
+    )
+    request = FakeScopeRequest(cookies={COOKIE_NAME: "valid-cookie"})
+    request.scope["user"] = None  # a stale "anonymous" cache value
+    assert await current_user(request, extend=False) is user
+    assert auth.calls == [("valid-cookie", False)]
+    assert request.scope["user"] is None  # extend=False does not overwrite cache
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +437,147 @@ async def test_missing_service_via_real_context_gives_actionable_error(
 # bearer_token
 
 
+# ---------------------------------------------------------------------------
+# bearer_user / authenticate — JWT → PAT (→ session for authenticate)
+
+
+class FakeAuthWithUsers(FakeAuthService):
+    """FakeAuthService plus ``get_user`` for the bearer resolvers."""
+
+    def __init__(self, sessions: Mapping[str, User], users: Mapping[str, User]) -> None:
+        super().__init__(sessions)
+        self._users = dict(users)
+
+    async def get_user(self, *, user_id: str) -> User | None:
+        return self._users.get(user_id)
+
+
+class FakeJWT:
+    """verify_access keyed by token string → sub (user id)."""
+
+    def __init__(self, valid: Mapping[str, str]) -> None:
+        self._valid = dict(valid)
+
+    def verify_access(self, token: str) -> dict | None:
+        sub = self._valid.get(token)
+        return {"sub": sub, "type": "access"} if sub else None
+
+
+class FakePat:
+    """resolve() keyed by raw token → (user_id, required_scope)."""
+
+    def __init__(self, tokens: Mapping[str, str], *, scope: str | None = None) -> None:
+        self._tokens = dict(tokens)
+        self._scope = scope
+        self.scope_calls: list[str | None] = []
+
+    async def resolve(self, *, raw_token: str, required_scope: str | None = None):
+        self.scope_calls.append(required_scope)
+        if required_scope is not None and required_scope != self._scope:
+            return None
+        user_id = self._tokens.get(raw_token)
+        return SimpleNamespace(user_id=user_id) if user_id else None
+
+
+def _bearer(token: str) -> FakeRequest:
+    return FakeRequest(headers={"authorization": f"Bearer {token}"})
+
+
+async def test_bearer_user_resolves_jwt(user: User) -> None:
+    from pyxle_auth.guards import bearer_user
+
+    auth = FakeAuthWithUsers({}, {user.id: user})
+    jwt = FakeJWT({"jwt-tok": user.id})
+    result = await bearer_user(_bearer("jwt-tok"), auth=auth, jwt=jwt, api_tokens=FakePat({}))
+    assert result is user
+
+
+async def test_bearer_user_falls_back_to_pat(user: User) -> None:
+    from pyxle_auth.guards import bearer_user
+
+    auth = FakeAuthWithUsers({}, {user.id: user})
+    jwt = FakeJWT({})  # not a valid JWT
+    pat = FakePat({"pyxle_pat_abc": user.id})
+    result = await bearer_user(_bearer("pyxle_pat_abc"), auth=auth, jwt=jwt, api_tokens=pat)
+    assert result is user
+
+
+async def test_bearer_user_no_header_is_none(user: User) -> None:
+    from pyxle_auth.guards import bearer_user
+
+    auth = FakeAuthWithUsers({}, {user.id: user})
+    result = await bearer_user(FakeRequest(), auth=auth, jwt=FakeJWT({}), api_tokens=FakePat({}))
+    assert result is None
+
+
+async def test_bearer_user_invalid_token_is_none(user: User) -> None:
+    from pyxle_auth.guards import bearer_user
+
+    auth = FakeAuthWithUsers({}, {user.id: user})
+    result = await bearer_user(
+        _bearer("garbage"), auth=auth, jwt=FakeJWT({}), api_tokens=FakePat({})
+    )
+    assert result is None
+
+
+async def test_bearer_user_enforces_pat_scope(user: User) -> None:
+    from pyxle_auth.guards import bearer_user
+
+    auth = FakeAuthWithUsers({}, {user.id: user})
+    pat = FakePat({"pyxle_pat_abc": user.id}, scope="deploy")
+    # Wrong scope → no user.
+    assert (
+        await bearer_user(
+            _bearer("pyxle_pat_abc"),
+            auth=auth,
+            jwt=FakeJWT({}),
+            api_tokens=pat,
+            required_scope="admin",
+        )
+        is None
+    )
+    # Right scope → user.
+    assert (
+        await bearer_user(
+            _bearer("pyxle_pat_abc"),
+            auth=auth,
+            jwt=FakeJWT({}),
+            api_tokens=pat,
+            required_scope="deploy",
+        )
+        is user
+    )
+
+
+async def test_authenticate_prefers_session(
+    signed_in: FakeRequest, auth: FakeAuthService, user: User
+) -> None:
+    from pyxle_auth.guards import authenticate
+
+    # A signed-in request resolves via the session — the bearer path isn't
+    # consulted (no Authorization header here anyway).
+    result = await authenticate(signed_in, service=auth)
+    assert result is user
+
+
+async def test_authenticate_falls_back_to_bearer(user: User) -> None:
+    from pyxle_auth.guards import authenticate
+
+    # No session cookie, but a JWT bearer. current_user(service=auth) returns
+    # None (no cookie), then the bearer path resolves.
+    request = FakeRequest(headers={"authorization": "Bearer jwt-tok"})
+    session_auth = FakeAuthService({})  # no sessions
+    bearer_auth = FakeAuthWithUsers({}, {user.id: user})
+    result = await authenticate(
+        request,
+        service=session_auth,
+        auth=bearer_auth,
+        jwt=FakeJWT({"jwt-tok": user.id}),
+        api_tokens=FakePat({}),
+    )
+    assert result is user
+
+
 def test_bearer_token_happy_path() -> None:
     request = FakeRequest(headers={"authorization": "Bearer pyxle_pat_abc123"})
     assert bearer_token(request) == "pyxle_pat_abc123"
@@ -416,3 +621,18 @@ def test_bearer_token_tolerates_surrounding_whitespace() -> None:
 def test_bearer_token_tolerates_extra_space_before_token() -> None:
     request = FakeRequest(headers={"authorization": "Bearer  tok"})
     assert bearer_token(request) == "tok"
+
+
+def test_login_required_aliases_are_the_guards():
+    # The roadmap-named aliases are thin re-exports of the existing guards —
+    # same function objects, importable from the package root.
+    import pyxle_auth
+    from pyxle_auth import guards
+
+    assert guards.login_required is guards.require_user_page
+    assert guards.login_required_action is guards.require_user_action
+    assert guards.permission_required is guards.require_permission_page
+    assert guards.permission_required_action is guards.require_permission_action
+
+    assert pyxle_auth.login_required is guards.require_user_page
+    assert pyxle_auth.permission_required is guards.require_permission_page

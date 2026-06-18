@@ -1,0 +1,74 @@
+from pyxle.runtime import ActionError
+
+
+@server
+async def load(request):
+    # request.state.db is injected by the pyxle-db plugin. A GET runs read-only.
+    notes = await request.state.db.fetchall(
+        "SELECT id, body, created_at FROM notes ORDER BY id DESC"
+    )
+    return {"notes": [dict(n) for n in notes]}
+
+
+@action
+async def add_note(request):
+    body = (await request.json()).get("body", "").strip()
+    if not body:
+        # Raising rolls back the auto-transaction — nothing is written.
+        raise ActionError("Note body cannot be empty.", status_code=422)
+    await request.state.db.execute("INSERT INTO notes (body) VALUES (?)", (body,))
+    return {"ok": True}
+
+
+@action
+async def delete_note(request):
+    note_id = (await request.json()).get("id")
+    await request.state.db.execute("DELETE FROM notes WHERE id = ?", (note_id,))
+    return {"ok": True}
+
+
+# --- JavaScript/PSX (Client + Server) ---
+
+import React, { useState } from 'react';
+import { useAction } from 'pyxle/client';
+
+export default function Notes({ data }) {
+  const [body, setBody] = useState('');
+  const add = useAction('add_note');
+  const remove = useAction('delete_note');
+
+  async function submit(e) {
+    e.preventDefault();
+    const result = await add({ body });
+    if (result.ok) {
+      setBody('');
+      window.location.reload();
+    }
+  }
+
+  return (
+    <main style={{ maxWidth: 540, margin: '2rem auto', fontFamily: 'system-ui' }}>
+      <h1>Notes</h1>
+      <form onSubmit={submit} style={{ display: 'flex', gap: 8 }}>
+        <input
+          value={body}
+          onChange={(e) => setBody(e.target.value)}
+          placeholder="Write a note…"
+          style={{ flex: 1, padding: 8 }}
+        />
+        <button type="submit" disabled={add.pending}>Add</button>
+      </form>
+      {add.error && <p style={{ color: 'crimson' }}>{add.error}</p>}
+      <ul>
+        {data.notes.map((note) => (
+          <li key={note.id} style={{ display: 'flex', justifyContent: 'space-between' }}>
+            <span>{note.body}</span>
+            <button onClick={() => remove({ id: note.id }).then(() => window.location.reload())}>
+              ✕
+            </button>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}

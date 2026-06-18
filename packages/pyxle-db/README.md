@@ -189,10 +189,13 @@ Settings (all optional):
 | `path` | SQLite path, resolved against the project root | `./data/app.db` |
 | `migrationsDir` | Migrations directory, applied at startup if it exists | `migrations` |
 | `waitForFileMs` | Poll this long for a SQLite file being created by another process | `0` |
+| `autoTransactions` | Auto-commit/rollback a transaction per unsafe-method request (see below) | `true` |
+| `orm` | Enable the SQLAlchemy ORM path (`{"metadata": "app.models:Base", "pool": {…}}`) | off |
 
 Registered services: `db.database` (the open `Database`), `db.url`
-(password-redacted connection string for logging), and — SQLite only —
-`db.path` (the resolved file path, kept for 0.1 consumers).
+(password-redacted connection string for logging), `db.auto_transactions`, and
+— SQLite only — `db.path`. With `orm` configured it also registers
+`db.orm.engine` and `db.orm.session_factory`.
 
 In loaders and actions, skip the service registry boilerplate:
 
@@ -204,6 +207,113 @@ async def load(request):
     db = get_database()
     return {"posts": await db.fetchall("SELECT * FROM posts ORDER BY id DESC")}
 ```
+
+## Request-scoped access & auto-transactions
+
+With the plugin installed, every loader and action gets a database handle on
+`request.state.db` — no import, no service lookup:
+
+```python
+@server
+async def load(request):
+    rows = await request.state.db.fetchall("SELECT * FROM posts ORDER BY id DESC")
+    return {"posts": rows}
+
+@action
+async def create_post(request):
+    body = await request.json()
+    await request.state.db.execute("INSERT INTO posts (title) VALUES (?)", (body["title"],))
+    return {"ok": True}
+```
+
+The handle is **lazy**: a request that never queries opens no connection.
+
+**Auto-transactions.** On an unsafe method (`POST`/`PUT`/`PATCH`/`DELETE`) the
+request's writes run inside one transaction that **commits when the action
+succeeds and rolls back when it fails** — where "fails" means the action raised
+`ActionError` (or any exception), which Pyxle turns into a non-2xx response.
+You don't write `commit()`/`rollback()`; a failed action never leaves a partial
+write behind. `GET`/`HEAD` requests run read-only (no held write transaction).
+
+Opt out when you need to manage transactions yourself:
+
+```python
+from pyxle_db import no_auto_transaction
+
+@action
+@no_auto_transaction
+async def transfer(request):
+    async with request.state.db.transaction() as tx:
+        await tx.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (amt, src))
+        await tx.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (amt, dst))
+```
+
+Set `"autoTransactions": false` to disable it app-wide.
+
+## The ORM path (SQLAlchemy)
+
+Prefer an ORM? Install the extra and turn it on — both paths are first-class,
+and the base install stays SQLAlchemy-free:
+
+```bash
+pip install 'pyxle-db[sqlalchemy]'
+```
+
+```json
+{ "name": "pyxle-db", "settings": { "url": "env:DATABASE_URL",
+  "orm": { "metadata": "app.models:Base" } } }
+```
+
+```python
+# app/models.py
+from sqlalchemy.orm import Mapped, mapped_column
+from pyxle_db.orm import Base
+
+class Note(Base):
+    __tablename__ = "notes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    body: Mapped[str]
+```
+
+```python
+from sqlalchemy import select
+
+@server
+async def load(request):
+    notes = (await request.state.session.scalars(select(Note))).all()
+    return {"notes": [n.body for n in notes]}
+
+@action
+async def add_note(request):
+    request.state.session.add(Note(body=(await request.json())["body"]))
+    return {"ok": True}  # committed automatically on success
+```
+
+`request.state.session` is a request-scoped `AsyncSession` under the same
+auto-transaction rules as `request.state.db`. SQLAlchemy errors surface as the
+**same** `pyxle_db` error types (`IntegrityError`, `OperationalError`, …) on both
+paths. Pool tuning lives under `orm.pool` (`poolSize`, `maxOverflow`,
+`poolTimeout`, `poolRecycle`, `poolPrePing` — pre-ping defaults on).
+
+## The `pyxle-db` CLI
+
+```bash
+pyxle-db migrate              # apply pending checksum migrations
+pyxle-db migrate --dry-run    # show what would be applied
+pyxle-db status               # applied vs pending
+
+# ORM migrations via Alembic (needs the [sqlalchemy] extra):
+pyxle-db alembic-init                         # scaffold alembic.ini + alembic/
+pyxle-db revision -m "add notes" --autogenerate
+pyxle-db upgrade head
+pyxle-db downgrade -1
+pyxle-db current      # / history
+```
+
+The CLI reads the same `pyxle.config.json` + `.env` your app does, so it always
+targets the identical database. Pick **one** migration tool per app: the
+checksum migrator (`migrate`) for the explicit-SQL path, Alembic for the ORM
+path.
 
 ## Upgrading from 0.1
 
@@ -223,9 +333,9 @@ async def load(request):
 
 ## Roadmap
 
-Short list, subject to change: pool-size tuning options for server
-backends, streaming fetches for large result sets, and `pyxle db` CLI
-commands for migration status/creation. Issues and PRs welcome.
+Short list, subject to change: streaming fetches for large result sets,
+read-replica routing, and slow-query/pool-stat observability hooks. Issues and
+PRs welcome.
 
 ## License
 

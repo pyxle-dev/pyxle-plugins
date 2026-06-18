@@ -269,6 +269,30 @@ class AuthService:
         Rate-limited by both ``ip`` and ``email`` independently; either
         can trip the limiter.
         """
+        user = await self.verify_credentials(email=email, password=password, ip=ip)
+        session_cookie = await self._issue_session(
+            user_id=user.id,
+            ip=ip,
+            user_agent=user_agent,
+        )
+        return user, session_cookie
+
+    async def verify_credentials(
+        self,
+        *,
+        email: str,
+        password: str,
+        ip: str | None = None,
+    ) -> User:
+        """Verify an email + password and return the :class:`User`.
+
+        The rate-limited, constant-time, enumeration-safe core that
+        :meth:`sign_in` builds on — split out so callers that authenticate
+        for something OTHER than a browser session (a JWT pair, an API
+        handshake) get the exact same protections without issuing a session.
+        Raises :class:`InvalidCredentials`, :class:`RateLimited`, or
+        :class:`EmailNotVerified` exactly as :meth:`sign_in` does.
+        """
         email_n = _normalise_email(email)
 
         # Reject over-length passwords BEFORE any argon2 work. A password
@@ -351,12 +375,60 @@ class AuthService:
 
         user = await self._load_user_by_id(row["id"])
         assert user is not None
-        session_cookie = await self._issue_session(
-            user_id=user.id,
-            ip=ip,
-            user_agent=user_agent,
+        return user
+
+    # ---- external identity (OAuth / SSO) ---------------------------------------
+
+    async def start_session(
+        self,
+        *,
+        user_id: str,
+        ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> SessionCookie:
+        """Issue a session for an ALREADY-AUTHENTICATED user.
+
+        For flows that establish identity without a password — OAuth sign-in,
+        magic links, admin impersonation. The caller is responsible for having
+        authenticated the user; this only mints the session cookie (same
+        sliding-expiry, hashed-at-rest token as :meth:`sign_in`).
+        """
+        return await self._issue_session(
+            user_id=user_id, ip=ip, user_agent=user_agent
         )
-        return user, session_cookie
+
+    async def create_external_user(
+        self,
+        *,
+        email: str,
+        email_verified: bool = False,
+    ) -> User:
+        """Create a passwordless account (OAuth / SSO).
+
+        The account stores an **unusable** password hash — a hash of a random
+        secret nobody holds — so it can never be signed into with a password
+        until the user sets one via the reset flow. ``email_verified`` stamps
+        ``email_verified_at`` (OAuth providers vouch for the address). Raises
+        :class:`AccountExists` if the email already has an account.
+        """
+        email_n = _normalise_email(email)
+        user_id = _generate_user_id()
+        unusable_hash = self._hasher.hash(secrets.token_urlsafe(32))
+        verified_at = _now_utc() if email_verified else None
+        try:
+            await self._db.execute(
+                """
+                INSERT INTO users
+                    (id, email, password_hash, email_verified_at, created_at, plan)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, email_n, unusable_hash, verified_at, _now_utc(), _DEFAULT_PLAN),
+            )
+        except IntegrityError:
+            raise AccountExists() from None
+        user = await self._load_user_by_id(user_id)
+        assert user is not None
+        return user
 
     # ---- resolve / refresh -----------------------------------------------------
 

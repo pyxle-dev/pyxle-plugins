@@ -217,6 +217,114 @@ async def test_config_settings_override_env(
         assert settings.rate_limit_password_reset_per_hour == 3  # default
 
 
+async def test_plugin_contributes_session_middleware() -> None:
+    """The plugin advertises its middleware through the public seam — the only
+    way a plugin can own request.user, the auth endpoints, and the OAuth flow
+    (there is no route-contribution seam)."""
+    from pyxle_auth.plugin import PyxleAuthPlugin
+
+    specs = list(PyxleAuthPlugin().middleware())
+    assert specs == [
+        ("pyxle_auth.oauth.middleware:OAuthMiddleware", {}),
+        ("pyxle_auth.middleware:AuthSessionMiddleware", {}),
+    ]
+    # OAuth is outer so it terminates /auth/oauth/* before the session layer.
+    assert specs[0][0].endswith("OAuthMiddleware")
+
+
+async def test_oauth_configured_registers_services(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYXLE_AUTH_OAUTH_GOOGLE_CLIENT_ID", "gid")
+    monkeypatch.setenv("PYXLE_AUTH_OAUTH_GOOGLE_CLIENT_SECRET", "gsecret")
+    async with _running_plugins(
+        tmp_path, {"oauth": {"providers": ["google"], "failureRedirect": "/login"}}
+    ) as ctx:
+        service = ctx.require("auth.oauth")
+        config = ctx.require("auth.oauth.config")
+        assert "google" in service.providers
+        assert config.auth_path_prefix == "/auth"
+        assert config.failure_redirect == "/login"
+        # The oauth_identities table exists and is empty.
+        db = ctx.require("db.database")
+        assert await db.fetchall("SELECT * FROM oauth_identities") == []
+
+
+async def test_oauth_missing_credentials_aborts_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PYXLE_AUTH_OAUTH_GITHUB_CLIENT_ID", raising=False)
+    monkeypatch.delenv("PYXLE_AUTH_OAUTH_GITHUB_CLIENT_SECRET", raising=False)
+    with pytest.raises(PluginError, match="missing credentials"):
+        async with _running_plugins(tmp_path, {"oauth": {"providers": ["github"]}}):
+            raise AssertionError("startup should have failed")
+
+
+async def test_oauth_not_configured_leaves_services_absent(tmp_path: Path) -> None:
+    async with _running_plugins(tmp_path) as ctx:
+        assert ctx.get("auth.oauth") is None
+        assert ctx.get("auth.oauth.config") is None
+
+
+async def test_jwt_configured_registers_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYXLE_AUTH_SECRET", "a-signing-secret")
+    async with _running_plugins(
+        tmp_path, {"jwt": {"accessTtlSeconds": 600}}
+    ) as ctx:
+        jwt = ctx.require("auth.jwt")
+        auth: AuthService = ctx.require("auth.service")
+        user, _ = await auth.sign_up(email="api@example.com", password="correct horse staple")
+        pair = await jwt.issue_pair(user_id=user.id)
+        assert jwt.verify_access(pair.access_token) is not None
+        # The jwt_refresh_tokens table exists.
+        db = ctx.require("db.database")
+        assert await db.fetchall("SELECT * FROM jwt_refresh_tokens WHERE used_at IS NOT NULL") == []
+
+
+async def test_jwt_not_configured_leaves_service_absent(tmp_path: Path) -> None:
+    async with _running_plugins(tmp_path) as ctx:
+        assert ctx.get("auth.jwt") is None
+
+
+def test_resolve_state_secret_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pyxle_auth.plugin import _resolve_state_secret
+
+    monkeypatch.setenv("PYXLE_AUTH_SECRET", "supersecret")
+    assert _resolve_state_secret(strict=True) == b"supersecret"
+
+
+def test_resolve_state_secret_strict_requires_a_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyxle.plugins import PluginServiceError
+
+    from pyxle_auth.plugin import _resolve_state_secret
+
+    monkeypatch.delenv("PYXLE_AUTH_SECRET", raising=False)
+    monkeypatch.delenv("PYXLE_SECRET_KEY", raising=False)
+    with pytest.raises(PluginServiceError, match="signing secret"):
+        _resolve_state_secret(strict=True)
+
+
+def test_resolve_state_secret_dev_generates_ephemeral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pyxle_auth.plugin import _resolve_state_secret
+
+    monkeypatch.delenv("PYXLE_AUTH_SECRET", raising=False)
+    monkeypatch.delenv("PYXLE_SECRET_KEY", raising=False)
+    secret = _resolve_state_secret(strict=False)
+    assert isinstance(secret, bytes) and len(secret) >= 16
+
+
+async def test_auth_path_prefix_flows_from_config(tmp_path: Path) -> None:
+    async with _running_plugins(tmp_path, {"authPathPrefix": "/account"}) as ctx:
+        settings: AuthSettings = ctx.require("auth.settings")
+        assert settings.auth_path_prefix == "/account"
+
+
 async def test_get_auth_service_and_settings_shortcuts(tmp_path: Path) -> None:
     """Django-style import helpers return the same instances
     ``request.app.state.pyxle_plugins.require(...)`` would, once the

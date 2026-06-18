@@ -84,6 +84,19 @@ class Migration:
 
 
 @dataclass(frozen=True, slots=True)
+class MigrationStatus:
+    """A snapshot of which migrations are applied vs still pending.
+
+    Returned by :meth:`Migrator.status` for the ``pyxle-db status`` /
+    ``--dry-run`` CLI. ``applied`` and ``pending`` are ordered by prefix, and
+    together cover every discovered migration.
+    """
+
+    applied: tuple[Migration, ...]
+    pending: tuple[Migration, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _MigrationFile:
     """A parsed migration filename; contents are not read at this stage."""
 
@@ -255,8 +268,35 @@ class Migrator:
         disappeared from the directory or a pending migration fails.
         """
         discovered = self.discover()
+        applied = await self._load_applied(discovered)
 
-        # The tracking table must exist before we can read what's applied.
+        applied_now: list[Migration] = []
+        for migration in discovered:
+            if migration.id in applied:
+                continue
+            await self._apply_one(migration)
+            applied_now.append(migration)
+        return applied_now
+
+    async def status(self) -> MigrationStatus:
+        """Return the applied vs pending migrations without changing anything.
+
+        Validates checksum drift (same as :meth:`apply_all`) so a drifted or
+        deleted migration surfaces in ``pyxle-db status`` / ``--dry-run`` rather
+        than only at apply time.
+        """
+        discovered = self.discover()
+        applied = await self._load_applied(discovered)
+        return MigrationStatus(
+            applied=tuple(m for m in discovered if m.id in applied),
+            pending=tuple(m for m in discovered if m.id not in applied),
+        )
+
+    # ---- internals -------------------------------------------------------------
+
+    async def _load_applied(self, discovered: list[Migration]) -> dict[str, str]:
+        """Ensure the tracking table exists, return ``{id: checksum}`` for every
+        applied migration, and validate that none have drifted or vanished."""
         # The dialect DDL targets the default name; rebind it to ours.
         ddl = self._db.dialect.migrations_table_ddl.replace(
             "schema_migrations", self._table
@@ -282,16 +322,7 @@ class Migrator:
                     recorded_hash=recorded_hash,
                     actual_hash=on_disk.checksum,
                 )
-
-        applied_now: list[Migration] = []
-        for migration in discovered:
-            if migration.id in applied:
-                continue
-            await self._apply_one(migration)
-            applied_now.append(migration)
-        return applied_now
-
-    # ---- internals -------------------------------------------------------------
+        return applied
 
     async def _apply_one(self, migration: Migration) -> None:
         # One transaction per migration: the script's statements and the

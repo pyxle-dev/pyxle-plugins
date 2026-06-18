@@ -46,6 +46,10 @@ class AuthSettings:
         cookie_samesite: ``Lax`` (default), ``Strict``, or ``None``.
         cookie_domain: ``None`` to bind to the current host only, or a
             domain string to share across subdomains (e.g. ``.pyxle.app``).
+        auth_path_prefix: URL prefix the session middleware serves its
+            endpoints under. Default ``/auth``.
+        enable_credentials_api: Serve ``POST {prefix}/login`` and
+            ``POST {prefix}/signup``. Default ``True``.
         password_reset_ttl_seconds: Lifetime of a password-reset token.
             Short by design — the link sits in an inbox.
         email_verify_ttl_seconds: Lifetime of an email-verification token.
@@ -77,6 +81,19 @@ class AuthSettings:
     cookie_domain: str | None = None
     cookie_path: str = "/"
 
+    # URL prefix under which AuthSessionMiddleware serves its endpoints
+    # (``{prefix}/me``, ``{prefix}/login``, ``{prefix}/signup``,
+    # ``{prefix}/logout``). Configurable so an app that already owns ``/auth``
+    # pages can move them aside.
+    auth_path_prefix: str = "/auth"
+
+    # Whether the session middleware serves the credential endpoints
+    # ``POST {prefix}/login`` and ``POST {prefix}/signup``. On by default
+    # (batteries-included; the client ``useAuth`` hook calls them). Turn off
+    # to roll your own sign-in/sign-up actions — ``/me`` and ``/logout`` stay
+    # available either way.
+    enable_credentials_api: bool = True
+
     # Token lifetimes (password reset / email verification)
     password_reset_ttl_seconds: int = 1800       # 30 minutes
     email_verify_ttl_seconds: int = 86400        # 24 hours
@@ -105,6 +122,15 @@ class AuthSettings:
         if self.cookie_samesite == "None" and not self.cookie_secure:
             raise ValueError(
                 "SameSite=None requires Secure=True; browsers drop the cookie otherwise"
+            )
+        if (
+            not self.auth_path_prefix.startswith("/")
+            or len(self.auth_path_prefix) < 2
+            or self.auth_path_prefix.endswith("/")
+        ):
+            raise ValueError(
+                "auth_path_prefix must be an absolute path with no trailing "
+                f'slash (e.g. "/auth"), got {self.auth_path_prefix!r}'
             )
         if self.strict and not self.cookie_secure:
             raise ValueError(
@@ -181,6 +207,10 @@ class AuthSettings:
             cookie_secure=cookie_secure,
             cookie_samesite=os.environ.get("PYXLE_AUTH_COOKIE_SAMESITE", "Lax"),
             cookie_domain=cookie_domain,
+            auth_path_prefix=os.environ.get("PYXLE_AUTH_PATH_PREFIX", "/auth"),
+            enable_credentials_api=_bool(
+                "PYXLE_AUTH_ENABLE_CREDENTIALS_API", True
+            ),
             password_reset_ttl_seconds=_int(
                 "PYXLE_AUTH_PASSWORD_RESET_TTL_SECONDS", 1800
             ),

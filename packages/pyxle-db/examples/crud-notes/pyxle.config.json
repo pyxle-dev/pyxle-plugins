@@ -1,0 +1,11 @@
+{
+  "plugins": [
+    {
+      "name": "pyxle-db",
+      "settings": {
+        "path": "./data/notes.db",
+        "migrationsDir": "migrations"
+      }
+    }
+  ]
+}

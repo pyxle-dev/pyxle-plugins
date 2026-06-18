@@ -43,8 +43,14 @@ from pyxle_auth.errors import (
     WeakPassword,
 )
 from pyxle_auth.guards import (
+    authenticate,
     bearer_token,
+    bearer_user,
     current_user,
+    login_required,
+    login_required_action,
+    permission_required,
+    permission_required_action,
     require_permission_action,
     require_permission_page,
     require_user_action,
@@ -121,14 +127,20 @@ __all__ = [
     "TokenService",
     "User",
     "WeakPassword",
+    "authenticate",
     "bearer_token",
+    "bearer_user",
     "current_user",
     "get_auth_service",
     "get_auth_settings",
+    "login_required",
+    "login_required_action",
+    "permission_required",
+    "permission_required_action",
     "require_permission_action",
     "require_permission_page",
     "require_user_action",
     "require_user_page",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

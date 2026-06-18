@@ -65,7 +65,7 @@ packages/
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e "packages/pyxle-db[postgres,mysql,dev]" -e "packages/pyxle-auth[dev]"
+pip install -e "packages/pyxle-db[sqlalchemy,postgres,mysql,dev]" -e "packages/pyxle-auth[dev]"
 
 # unit + SQLite suites
 (cd packages/pyxle-db && pytest)

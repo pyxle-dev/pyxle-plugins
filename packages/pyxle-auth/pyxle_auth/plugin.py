@@ -16,6 +16,12 @@ Registered services:
 * ``auth.settings`` — the resolved :class:`AuthSettings`, the same
   source of truth the services read.
 
+The plugin also contributes :class:`pyxle_auth.middleware.AuthSessionMiddleware`,
+which populates ``request.user`` on every request and serves the
+``{authPathPrefix}/me``, ``/login``, ``/signup``, and ``/logout`` endpoints the
+client ``useAuth`` hook talks to (``/login`` + ``/signup`` are gated by
+``enableCredentialsApi``).
+
 Config shape::
 
     {
@@ -42,6 +48,10 @@ the built-in default. All keys are optional:
 * ``cookieSecure`` — ``True`` in production. Default ``True`` (strict).
 * ``cookieSameSite`` — ``Lax`` / ``Strict`` / ``None``. Default ``Lax``.
 * ``cookiePath`` — cookie path. Default ``/``.
+* ``authPathPrefix`` — URL prefix the session middleware serves its
+  endpoints under. Default ``/auth``.
+* ``enableCredentialsApi`` — serve ``POST {prefix}/login`` and
+  ``POST {prefix}/signup``. Default ``True``.
 * ``sessionTtlSeconds`` — sliding session lifetime. Default 30d.
 * ``sessionAbsoluteMaxSeconds`` — hard cap. Default 90d.
 * ``passwordResetTtlSeconds`` — reset-token lifetime. Default 1800.
@@ -66,6 +76,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -105,6 +116,8 @@ _SETTINGS_MAP: Mapping[str, str] = {
     "cookieSameSite": "cookie_samesite",
     "cookieDomain": "cookie_domain",
     "cookiePath": "cookie_path",
+    "authPathPrefix": "auth_path_prefix",
+    "enableCredentialsApi": "enable_credentials_api",
     "passwordResetTtlSeconds": "password_reset_ttl_seconds",
     "emailVerifyTtlSeconds": "email_verify_ttl_seconds",
     "rateLimitSignInPerHour": "rate_limit_sign_in_per_hour",
@@ -123,7 +136,21 @@ class _SchemaOwner(Protocol):
 
 class PyxleAuthPlugin(PyxlePlugin):
     name = "pyxle-auth"
-    version = "0.2.0"
+    version = "0.3.0"
+
+    def middleware(self) -> Sequence[tuple[str, Mapping[str, Any]]]:
+        """Contribute the OAuth + session middleware.
+
+        ``OAuthMiddleware`` is outer so it terminates ``{prefix}/oauth/...``
+        requests before the session middleware does any ambient work; both are
+        inert when their service isn't registered. See
+        :class:`pyxle_auth.oauth.middleware.OAuthMiddleware` and
+        :class:`pyxle_auth.middleware.AuthSessionMiddleware`.
+        """
+        return [
+            ("pyxle_auth.oauth.middleware:OAuthMiddleware", {}),
+            ("pyxle_auth.middleware:AuthSessionMiddleware", {}),
+        ]
 
     async def on_startup(self, ctx: PluginContext) -> None:
         try:
@@ -141,7 +168,14 @@ class PyxleAuthPlugin(PyxlePlugin):
                 "pyxle.config.json::plugins."
             ) from exc
 
-        auth_settings = _build_auth_settings(self.settings or {})
+        # ``oauth`` and ``jwt`` are config blocks, not AuthSettings fields;
+        # split them out before the settings translation (which rejects unknown
+        # keys).
+        raw_settings = dict(self.settings or {})
+        oauth_settings = raw_settings.pop("oauth", None)
+        jwt_settings = raw_settings.pop("jwt", None)
+
+        auth_settings = _build_auth_settings(raw_settings)
         service = AuthService(database, auth_settings)
         rbac = RoleService(database)
         tokens = TokenService(database)
@@ -155,12 +189,132 @@ class PyxleAuthPlugin(PyxlePlugin):
         ctx.register("auth.api_tokens", api_tokens)
         ctx.register("auth.settings", auth_settings)
 
+        if oauth_settings:
+            await _start_oauth(
+                ctx, database, service, auth_settings, oauth_settings
+            )
+        if jwt_settings is not None:
+            await _start_jwt(ctx, database, auth_settings, jwt_settings)
+
         _logger.info(
             "pyxle-auth: services ready (cookie=%s, ttl=%ds, strict=%s)",
             auth_settings.cookie_name,
             auth_settings.session_lifetime_seconds,
             auth_settings.strict,
         )
+
+
+async def _start_oauth(
+    ctx: PluginContext,
+    database: DatabaseLike,
+    auth_service: AuthService,
+    auth_settings: AuthSettings,
+    oauth_settings: Any,
+) -> None:
+    """Build the OAuthService + flow config from the ``oauth`` settings block.
+
+    Provider credentials come from the environment only
+    (``PYXLE_AUTH_OAUTH_<PROVIDER>_CLIENT_*``); a missing one aborts startup
+    with an actionable error. Imported here (not at module top) so apps that
+    don't use OAuth never load the provider/middleware code.
+    """
+    from pyxle_auth.oauth.errors import OAuthConfigError
+    from pyxle_auth.oauth.middleware import OAuthFlowConfig
+    from pyxle_auth.oauth.providers import OAuthProvider
+    from pyxle_auth.oauth.service import OAuthService
+
+    if not isinstance(oauth_settings, Mapping):
+        raise PluginServiceError(
+            "pyxle-auth: the 'oauth' setting must be an object, e.g. "
+            '{"providers": ["google"]}.'
+        )
+    names = oauth_settings.get("providers") or []
+    if not names:
+        return
+
+    providers: dict[str, OAuthProvider] = {}
+    for name in names:
+        try:
+            provider = OAuthProvider.from_env(str(name))
+        except OAuthConfigError as exc:
+            raise PluginServiceError(f"pyxle-auth: {exc}") from exc
+        providers[provider.name] = provider
+
+    oauth_service = OAuthService(database, auth_service, providers)
+    await oauth_service.ensure_schema()
+
+    config = OAuthFlowConfig(
+        state_secret=_resolve_state_secret(auth_settings.strict),
+        auth_path_prefix=auth_settings.auth_path_prefix,
+        cookie_secure=auth_settings.cookie_secure,
+        cookie_domain=auth_settings.cookie_domain,
+        redirect_base_url=oauth_settings.get("redirectBaseUrl"),
+        failure_redirect=str(oauth_settings.get("failureRedirect", "/")),
+        state_ttl_seconds=int(oauth_settings.get("stateTtlSeconds", 600)),
+    )
+    ctx.register("auth.oauth", oauth_service)
+    ctx.register("auth.oauth.config", config)
+    _logger.info(
+        "pyxle-auth: OAuth ready (providers=%s)", ", ".join(sorted(providers))
+    )
+
+
+async def _start_jwt(
+    ctx: PluginContext,
+    database: DatabaseLike,
+    auth_settings: AuthSettings,
+    jwt_settings: Any,
+) -> None:
+    """Build the JWTService from the ``jwt`` settings block.
+
+    Signs with the same secret as the OAuth state cookie
+    (``PYXLE_AUTH_SECRET`` / ``PYXLE_SECRET_KEY``). Imported here (not at module
+    top) so apps that don't use JWT never load ``pyjwt``.
+    """
+    from pyxle_auth.jwt_tokens import JWTService
+
+    if not isinstance(jwt_settings, Mapping):
+        raise PluginServiceError(
+            "pyxle-auth: the 'jwt' setting must be an object, e.g. "
+            '{"accessTtlSeconds": 900}.'
+        )
+    access_ttl = int(jwt_settings.get("accessTtlSeconds", 900))
+    jwt_service = JWTService(
+        database,
+        # The HMAC key — pyjwt accepts the raw bytes the secret resolver returns.
+        secret=_resolve_state_secret(auth_settings.strict),
+        access_ttl_seconds=access_ttl,
+        refresh_ttl_seconds=int(jwt_settings.get("refreshTtlSeconds", 2_592_000)),
+        issuer=jwt_settings.get("issuer"),
+    )
+    await jwt_service.ensure_schema()
+    ctx.register("auth.jwt", jwt_service)
+    _logger.info("pyxle-auth: JWT ready (access ttl=%ds)", access_ttl)
+
+
+def _resolve_state_secret(strict: bool) -> bytes:
+    """The HMAC key for the OAuth state cookie.
+
+    Read from ``PYXLE_AUTH_SECRET`` (preferred) or the framework-wide
+    ``PYXLE_SECRET_KEY``. In strict mode a missing secret aborts startup — an
+    unsigned state cookie has no integrity. In dev (non-strict) an ephemeral
+    key is generated, with a warning, so local OAuth works without setup (the
+    cost: in-flight flows break across a restart).
+    """
+    raw = os.environ.get("PYXLE_AUTH_SECRET") or os.environ.get("PYXLE_SECRET_KEY")
+    if raw:
+        return raw.encode("utf-8")
+    if strict:
+        raise PluginServiceError(
+            "pyxle-auth: OAuth needs a signing secret for the state cookie. "
+            "Set PYXLE_AUTH_SECRET (or PYXLE_SECRET_KEY) in the environment."
+        )
+    _logger.warning(
+        "pyxle-auth: no PYXLE_AUTH_SECRET/PYXLE_SECRET_KEY set — using an "
+        "ephemeral OAuth state secret (dev only; in-flight sign-ins break on "
+        "restart)."
+    )
+    return secrets.token_bytes(32)
 
 
 async def _apply_schema(

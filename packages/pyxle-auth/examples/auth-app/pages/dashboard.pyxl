@@ -1,0 +1,40 @@
+from pyxle_auth import require_user_page
+
+
+@server
+async def load(request):
+    # Enforce auth at the loader: anonymous requests raise LoaderError(401),
+    # which renders the nearest error.pyxl (here: a sign-in prompt).
+    user = await require_user_page(request)
+    return {
+        "email": user.email,
+        "plan": user.plan,
+        "emailVerified": user.email_verified_at is not None,
+    }
+
+
+# --- Client ---
+
+import React from 'react';
+import { Link, useAuth } from 'pyxle/client';
+
+export default function Dashboard({ data }) {
+  const { logout } = useAuth();
+
+  return (
+    <main style={{ maxWidth: 520, margin: '3rem auto', fontFamily: 'system-ui' }}>
+      <h1>Dashboard</h1>
+      <p>Welcome, <strong>{data.email}</strong>.</p>
+      <ul>
+        <li>Plan: {data.plan}</li>
+        <li>Email verified: {data.emailVerified ? 'yes' : 'no'}</li>
+      </ul>
+      <div style={{ display: 'flex', gap: 12, marginTop: 16 }}>
+        <Link href="/">Home</Link>
+        <button onClick={() => logout().then(() => (window.location.href = '/'))}>
+          Sign out
+        </button>
+      </div>
+    </main>
+  );
+}

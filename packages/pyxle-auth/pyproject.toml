@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-auth"
-version = "0.2.0"
+version = "0.3.0"
 description = "Authentication plugin for Pyxle: argon2id sessions, password reset and email verification flows, RBAC, scoped API tokens, and request guards."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,9 +32,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Social sign-in (Google / GitHub / Discord). Only needed when the `oauth`
+# plugin setting is configured; the rest of pyxle-auth never imports httpx.
+oauth = [
+  "httpx>=0.24",
+]
+# JWT access tokens for API / mobile clients. Only needed when the `jwt`
+# plugin setting is configured; the rest of pyxle-auth never imports pyjwt.
+jwt = [
+  "pyjwt>=2.4",
+]
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
+  "httpx>=0.24",
+  "pyjwt>=2.4",
 ]
 
 [project.urls]

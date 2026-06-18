@@ -1,0 +1,47 @@
+@server
+async def load(request):
+    # request.user is populated by pyxle-auth's session middleware on every
+    # request — no guard needed just to read it.
+    user = request.user
+    return {"user": {"email": user.email, "plan": user.plan} if user else None}
+
+
+# --- Client ---
+
+import React from 'react';
+import { Link, useAuth } from 'pyxle/client';
+
+export default function Home({ data }) {
+  const { isAuthenticated, loading, logout } = useAuth();
+
+  return (
+    <main style={{ maxWidth: 520, margin: '3rem auto', fontFamily: 'system-ui' }}>
+      <h1>pyxle-auth demo</h1>
+
+      {/* `data.user` is the server-rendered truth (request.user); `useAuth`
+          is the live client state, seeded from the server so they agree. */}
+      {data.user ? (
+        <p>
+          Signed in as <strong>{data.user.email}</strong> ({data.user.plan} plan).
+        </p>
+      ) : (
+        <p>You are not signed in.</p>
+      )}
+
+      <nav style={{ display: 'flex', gap: 12 }}>
+        <Link href="/dashboard">Dashboard</Link>
+        {!loading && !isAuthenticated && (
+          <>
+            <Link href="/login">Sign in</Link>
+            <Link href="/register">Create account</Link>
+          </>
+        )}
+        {isAuthenticated && (
+          <button onClick={() => logout().then(() => (window.location.href = '/'))}>
+            Sign out
+          </button>
+        )}
+      </nav>
+    </main>
+  );
+}

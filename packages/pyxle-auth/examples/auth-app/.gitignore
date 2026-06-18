@@ -1,0 +1,6 @@
+# Generated locally — never commit the dev database or build artifacts.
+data/
+.pyxle-build/
+dist/
+node_modules/
+.env
