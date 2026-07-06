@@ -22,7 +22,11 @@ class User:
     """
 
     id: str
-    email: str
+    # Exactly one of ``email`` / ``username`` is the login identifier (see
+    # ``AuthSettings.identifier``); the other may be ``None``. Email-mode apps
+    # always have an email and a ``None`` username — unchanged from before.
+    email: str | None
+    username: str | None
     email_verified_at: datetime | None
     created_at: datetime
     plan: str

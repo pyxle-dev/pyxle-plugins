@@ -24,10 +24,24 @@ class InvalidCredentials(AuthError):
 
 
 class AccountExists(AuthError):
-    """Sign-up attempted with an email that already has an account."""
+    """Sign-up attempted with an identifier that already has an account.
 
-    def __init__(self) -> None:
-        super().__init__("An account with this email already exists.")
+    The message names the configured identifier so it reads correctly in both
+    modes (and doesn't say "email" when a *username* collided — which would
+    both confuse and, in username mode, leak nothing useful since username
+    availability is public by design).
+    """
+
+    def __init__(
+        self, message: str | None = None, *, identifier: str = "email"
+    ) -> None:
+        if message is None:
+            message = (
+                "That username is already taken."
+                if identifier == "username"
+                else "An account with this email already exists."
+            )
+        super().__init__(message)
 
 
 class RateLimited(AuthError):

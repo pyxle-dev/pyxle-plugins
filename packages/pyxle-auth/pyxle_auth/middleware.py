@@ -78,6 +78,7 @@ def user_to_json(user: Any) -> dict[str, Any] | None:
     return {
         "id": user.id,
         "email": user.email,
+        "username": user.username,
         "emailVerified": user.email_verified_at is not None,
         "plan": user.plan,
         "createdAt": user.created_at.isoformat(),
@@ -144,6 +145,13 @@ class AuthSessionMiddleware:
                 if request.method == "POST":
                     return await self._signup(request, service, settings)
                 return _method_not_allowed("POST")
+            if (
+                settings.identifier == "username"
+                and path == prefix + "/username-available"
+            ):
+                if request.method == "GET":
+                    return await self._username_available(request, service)
+                return _method_not_allowed("GET")
 
         # JWT token endpoints — served only when the JWT service is configured.
         jwt_service = ctx.get(_JWT_SERVICE) if ctx is not None else None
@@ -196,35 +204,68 @@ class AuthSessionMiddleware:
         body = await _json_body(request)
         if body is None:
             return _bad_request("Expected a JSON body.")
-        email = body.get("email")
+        field = settings.identifier  # "email" (default) or "username"
+        value = body.get(field)
         password = body.get("password")
-        if not isinstance(email, str) or not isinstance(password, str):
-            return _bad_request("Both 'email' and 'password' are required.")
+        if not isinstance(value, str) or not isinstance(password, str):
+            return _bad_request(f"Both '{field}' and 'password' are required.")
         try:
             user, cookie = await service.sign_in(
-                email=email,
                 password=password,
                 ip=_client_ip(request),
                 user_agent=request.headers.get("user-agent"),
+                **{field: value},
             )
         except AuthError as exc:
             return _auth_error_response(exc)
         return _authenticated_response(user, cookie)
 
+    async def _username_available(self, request: Request, service: Any) -> Response:
+        """``GET {prefix}/username-available?u=<name>`` → ``{"available": bool}``.
+
+        Username availability is intentionally public (a user must know whether
+        a handle is free before claiming it). A malformed or reserved handle
+        comes back ``available: false`` with a ``reason`` the picker can show.
+        """
+        name = (
+            request.query_params.get("u")
+            or request.query_params.get("username")
+            or ""
+        )
+        try:
+            available = await service.username_available(
+                name, ip=_client_ip(request)
+            )
+        except RateLimited as exc:
+            # Too many checks from this IP — 429 with Retry-After (caught before
+            # the generic AuthError handler, since RateLimited subclasses it).
+            return _auth_error_response(exc)
+        except AuthError as exc:
+            return JSONResponse({"available": False, "reason": str(exc)})
+        return JSONResponse({"available": available})
+
     async def _signup(self, request: Request, service: Any, settings: Any) -> Response:
         body = await _json_body(request)
         if body is None:
             return _bad_request("Expected a JSON body.")
-        email = body.get("email")
+        field = settings.identifier  # "email" (default) or "username"
+        value = body.get(field)
         password = body.get("password")
-        if not isinstance(email, str) or not isinstance(password, str):
-            return _bad_request("Both 'email' and 'password' are required.")
+        if not isinstance(value, str) or not isinstance(password, str):
+            return _bad_request(f"Both '{field}' and 'password' are required.")
+        kwargs: dict[str, Any] = {field: value}
+        # In username mode an app may still collect an optional email (e.g. for
+        # future password reset); pass it through when supplied.
+        if settings.identifier == "username":
+            extra_email = body.get("email")
+            if isinstance(extra_email, str) and extra_email:
+                kwargs["email"] = extra_email
         try:
             user, cookie = await service.sign_up(
-                email=email,
                 password=password,
                 ip=_client_ip(request),
                 user_agent=request.headers.get("user-agent"),
+                **kwargs,
             )
         except AuthError as exc:
             return _auth_error_response(exc)
@@ -241,13 +282,14 @@ class AuthSessionMiddleware:
         body = await _json_body(request)
         if body is None:
             return _bad_request("Expected a JSON body.")
-        email = body.get("email")
+        field = service.settings.identifier  # "email" (default) or "username"
+        value = body.get(field)
         password = body.get("password")
-        if not isinstance(email, str) or not isinstance(password, str):
-            return _bad_request("Both 'email' and 'password' are required.")
+        if not isinstance(value, str) or not isinstance(password, str):
+            return _bad_request(f"Both '{field}' and 'password' are required.")
         try:
             user = await service.verify_credentials(
-                email=email, password=password, ip=_client_ip(request)
+                password=password, ip=_client_ip(request), **{field: value}
             )
         except AuthError as exc:
             return _auth_error_response(exc)
@@ -295,7 +337,15 @@ def _auth_seed(user: Any, settings: Any) -> dict[str, Any]:
     if settings.enable_credentials_api:
         endpoints["login"] = prefix + "/login"
         endpoints["signup"] = prefix + "/signup"
-    return {"user": user_to_json(user), "endpoints": endpoints}
+        if settings.identifier == "username":
+            endpoints["usernameAvailable"] = prefix + "/username-available"
+    # ``identifier`` tells the client which field to render and post — "email"
+    # (default) or "username". Keeps the form and the server in lockstep.
+    return {
+        "user": user_to_json(user),
+        "identifier": settings.identifier,
+        "endpoints": endpoints,
+    }
 
 
 async def _json_body(request: Request) -> dict[str, Any] | None:

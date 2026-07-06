@@ -182,4 +182,5 @@ async def test_plugin_startup_accepts_any_db_database_service(
         "0001-pyxle-auth-core",
         "0002-oauth-identities",
         "0003-jwt-refresh-tokens",
+        "0004-flexible-identity",
     ]

@@ -53,6 +53,7 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from pyxle_db import DatabaseLike, IntegrityError
 
 from pyxle_auth._ddl import ensure_index, timestamp_type
+from pyxle_auth._identity import normalise_username
 from pyxle_auth.errors import (
     AccountExists,
     AuthError,
@@ -174,7 +175,8 @@ class AuthService:
                 """
                 CREATE TABLE IF NOT EXISTS users (
                     id                VARCHAR(64) PRIMARY KEY,
-                    email             VARCHAR(255) NOT NULL UNIQUE,
+                    email             VARCHAR(255) UNIQUE,
+                    username          VARCHAR(64) UNIQUE,
                     password_hash     TEXT NOT NULL,
                     email_verified_at {ts},
                     created_at        {ts} NOT NULL,
@@ -203,22 +205,59 @@ class AuthService:
 
     # ---- sign-up ---------------------------------------------------------------
 
+    def _normalise_username(self, raw: str) -> str:
+        """Validate + normalise a username against this service's policy."""
+        return normalise_username(
+            raw,
+            min_length=self._settings.username_min_length,
+            max_length=self._settings.username_max_length,
+            pattern=self._settings.username_pattern,
+            reserved=self._settings.username_reserved,
+        )
+
+    def _resolve_signup_identifiers(
+        self, *, email: str | None, username: str | None
+    ) -> tuple[str | None, str | None]:
+        """Validate sign-up identifiers, returning ``(email, username)`` normalised.
+
+        The configured primary identifier (:attr:`AuthSettings.identifier`) is
+        required; the other is accepted and stored when supplied — so a
+        username-mode app may still collect an optional email. Raises
+        :class:`AuthError` if the primary is missing or any value is invalid.
+        """
+        email_n = _normalise_email(email) if email else None
+        username_n = self._normalise_username(username) if username else None
+        if self._settings.identifier == "username":
+            if username_n is None:
+                raise AuthError("Please choose a username.")
+        elif email_n is None:
+            raise AuthError("Please enter an email address.")
+        return email_n, username_n
+
     async def sign_up(
         self,
         *,
-        email: str,
         password: str,
+        email: str | None = None,
+        username: str | None = None,
         ip: str | None = None,
         user_agent: str | None = None,
     ) -> tuple[User, SessionCookie]:
         """Create an account and return the user + a session cookie.
 
+        Pass the identifier your app is configured for: an ``email`` (default),
+        a ``username`` (when ``AuthSettings.identifier == "username"``), or both
+        (the configured one is required, the other optional).
+
         Raises:
-            :class:`AccountExists` if ``email`` already has a user.
+            :class:`AccountExists` if the email or username is already taken.
             :class:`WeakPassword` if the password violates policy.
             :class:`RateLimited` if the caller (by IP) exceeded the hourly cap.
+            :class:`AuthError` if the required identifier is missing/invalid.
         """
-        email_n = _normalise_email(email)
+        email_n, username_n = self._resolve_signup_identifiers(
+            email=email, username=username
+        )
         self._check_password_policy(password)
 
         if ip is not None:
@@ -236,14 +275,16 @@ class AuthService:
         try:
             await self._db.execute(
                 """
-                INSERT INTO users (id, email, password_hash, created_at, plan)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users (id, email, username, password_hash, created_at, plan)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, email_n, password_hash, _now_utc(), _DEFAULT_PLAN),
+                (user_id, email_n, username_n, password_hash, _now_utc(), _DEFAULT_PLAN),
             )
         except IntegrityError:
-            # UNIQUE(email)
-            raise AccountExists() from None
+            # UNIQUE(email) or UNIQUE(username) — identifier already taken. The
+            # message names the configured identifier so it's correct in both
+            # modes (never says "email" for a username collision).
+            raise AccountExists(identifier=self._settings.identifier) from None
 
         user = await self._load_user_by_id(user_id)
         assert user is not None
@@ -254,22 +295,55 @@ class AuthService:
         )
         return user, session_cookie
 
+    async def username_available(
+        self, username: str, *, ip: str | None = None
+    ) -> bool:
+        """Return ``True`` if *username* is valid **and** not yet taken.
+
+        Validates against the configured policy first — raising
+        :class:`AuthError` (with the reason) if the handle is malformed or
+        reserved — then checks the table. Availability is intentionally public:
+        a user must know whether a handle is free before claiming it.
+
+        Pass ``ip`` (the public HTTP endpoint does) to rate-limit checks
+        per-IP — enough for a debounced picker, but enough friction to make
+        bulk enumeration of the user list impractical. Raises
+        :class:`RateLimited` when the per-IP cap is exceeded.
+        """
+        if ip is not None:
+            rl = await self._ratelimiter.check_and_increment(
+                scope="auth:username-check",
+                identifier=ip,
+                limit=self._settings.rate_limit_username_check_per_hour,
+            )
+            if not rl.allowed:
+                raise RateLimited(rl.retry_after_seconds)
+        username_n = self._normalise_username(username)
+        row = await self._db.fetchone(
+            "SELECT 1 FROM users WHERE username = ?", (username_n,)
+        )
+        return row is None
+
     # ---- sign-in ---------------------------------------------------------------
 
     async def sign_in(
         self,
         *,
-        email: str,
         password: str,
+        email: str | None = None,
+        username: str | None = None,
         ip: str | None = None,
         user_agent: str | None = None,
     ) -> tuple[User, SessionCookie]:
         """Verify credentials and return a fresh session.
 
-        Rate-limited by both ``ip`` and ``email`` independently; either
-        can trip the limiter.
+        Pass the configured login identifier — ``email`` (default) or
+        ``username``. Rate-limited by both ``ip`` and the identifier
+        independently; either can trip the limiter.
         """
-        user = await self.verify_credentials(email=email, password=password, ip=ip)
+        user = await self.verify_credentials(
+            email=email, username=username, password=password, ip=ip
+        )
         session_cookie = await self._issue_session(
             user_id=user.id,
             ip=ip,
@@ -277,14 +351,35 @@ class AuthService:
         )
         return user, session_cookie
 
+    def _login_lookup(
+        self, *, email: str | None, username: str | None
+    ) -> tuple[str, str]:
+        """Resolve the ``(column, value)`` to match at sign-in.
+
+        Uses the configured identifier. Unlike sign-up this does NOT run the
+        full username policy — a malformed handle simply matches no row and
+        surfaces as :class:`InvalidCredentials`, so sign-in never leaks the
+        username rules and stays enumeration-safe. Email keeps its existing
+        light normalisation.
+        """
+        if self._settings.identifier == "username":
+            value = (username or "").strip().lower()
+            if not value:
+                raise InvalidCredentials()
+            return "username", value
+        if not email:
+            raise InvalidCredentials()
+        return "email", _normalise_email(email)
+
     async def verify_credentials(
         self,
         *,
-        email: str,
         password: str,
+        email: str | None = None,
+        username: str | None = None,
         ip: str | None = None,
     ) -> User:
-        """Verify an email + password and return the :class:`User`.
+        """Verify the configured identifier + password, returning the :class:`User`.
 
         The rate-limited, constant-time, enumeration-safe core that
         :meth:`sign_in` builds on — split out so callers that authenticate
@@ -293,7 +388,7 @@ class AuthService:
         Raises :class:`InvalidCredentials`, :class:`RateLimited`, or
         :class:`EmailNotVerified` exactly as :meth:`sign_in` does.
         """
-        email_n = _normalise_email(email)
+        column, ident_n = self._login_lookup(email=email, username=username)
 
         # Reject over-length passwords BEFORE any argon2 work. A password
         # longer than the policy max can never match a stored hash (sign_up
@@ -304,9 +399,9 @@ class AuthService:
             raise InvalidCredentials()
 
         # The IP bucket throttles a single abusive source pre-verify. The
-        # email bucket is checked too, but a CORRECT password always wins
-        # (below), so flooding a victim's email with wrong guesses can never
-        # lock the legitimate owner out of their own account.
+        # per-identifier bucket is checked too, but a CORRECT password always
+        # wins (below), so flooding a victim's account with wrong guesses can
+        # never lock the legitimate owner out of their own account.
         if ip is not None:
             ip_rl = await self._ratelimiter.check_and_increment(
                 scope="auth:sign-in:ip",
@@ -315,16 +410,18 @@ class AuthService:
             )
             if not ip_rl.allowed:
                 raise RateLimited(ip_rl.retry_after_seconds)
-        email_rl = await self._ratelimiter.check_and_increment(
-            scope="auth:sign-in:email",
-            identifier=email_n,
+        ident_rl = await self._ratelimiter.check_and_increment(
+            scope=f"auth:sign-in:{column}",
+            identifier=ident_n,
             limit=self._settings.rate_limit_sign_in_per_hour,
         )
-        email_limited = not email_rl.allowed
+        ident_limited = not ident_rl.allowed
 
+        # ``column`` is one of our own literals ("email"/"username"), never
+        # user input, so the interpolation here is injection-safe.
         row = await self._db.fetchone(
-            "SELECT id, password_hash, email_verified_at FROM users WHERE email = ?",
-            (email_n,),
+            f"SELECT id, email, password_hash, email_verified_at FROM users WHERE {column} = ?",
+            (ident_n,),
         )
         if row is None:
             # Constant-time dummy verify so we don't leak account existence
@@ -333,22 +430,22 @@ class AuthService:
                 self._hasher.verify(self._timing_hash, password)
             except VerifyMismatchError:
                 pass
-            # No real account to protect; an exhausted email bucket may
+            # No real account to protect; an exhausted identifier bucket may
             # surface as RateLimited, otherwise it's a normal bad login.
-            if email_limited:
-                raise RateLimited(email_rl.retry_after_seconds)
+            if ident_limited:
+                raise RateLimited(ident_rl.retry_after_seconds)
             raise InvalidCredentials()
 
         try:
             self._hasher.verify(row["password_hash"], password)
         except (VerifyMismatchError, InvalidHashError):
-            # Wrong password: NOW the email bucket may block, throttling a
+            # Wrong password: NOW the identifier bucket may block, throttling a
             # distributed guessing campaign against this one account.
-            if email_limited:
-                raise RateLimited(email_rl.retry_after_seconds) from None
+            if ident_limited:
+                raise RateLimited(ident_rl.retry_after_seconds) from None
             raise InvalidCredentials() from None
 
-        # Correct password from here on — the email bucket is deliberately
+        # Correct password from here on — the identifier bucket is deliberately
         # NOT consulted, so the owner is never locked out by others' failures.
 
         # Opportunistic rehash: if our argon2 params have moved on since
@@ -361,17 +458,23 @@ class AuthService:
                 (new_hash, row["id"]),
             )
 
+        # Email verification only gates accounts that HAVE an email. A
+        # username-only account (email NULL) can never verify an email it
+        # doesn't have, so requiring verification must not lock it out.
         if (
             self._settings.require_email_verified
+            and row["email"] is not None
             and row["email_verified_at"] is None
         ):
             raise EmailNotVerified("Please verify your email before signing in.")
 
-        # Legitimate sign-in clears the IP+email buckets so this user
+        # Legitimate sign-in clears the IP + identifier buckets so this user
         # isn't locked out next hour.
         if ip is not None:
             await self._ratelimiter.reset(scope="auth:sign-in:ip", identifier=ip)
-        await self._ratelimiter.reset(scope="auth:sign-in:email", identifier=email_n)
+        await self._ratelimiter.reset(
+            scope=f"auth:sign-in:{column}", identifier=ident_n
+        )
 
         user = await self._load_user_by_id(row["id"])
         assert user is not None
@@ -792,7 +895,7 @@ class AuthService:
     async def _load_user_by_id(self, user_id: str) -> User | None:
         row = await self._db.fetchone(
             """
-            SELECT id, email, email_verified_at, created_at, plan
+            SELECT id, email, username, email_verified_at, created_at, plan
             FROM users WHERE id = ?
             """,
             (user_id,),
@@ -802,6 +905,7 @@ class AuthService:
         return User(
             id=row["id"],
             email=row["email"],
+            username=row["username"],
             email_verified_at=_aware_or_none(row["email_verified_at"]),
             created_at=_aware(row["created_at"]),
             plan=row["plan"],

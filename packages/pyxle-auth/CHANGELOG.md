@@ -5,6 +5,44 @@ All notable changes to `pyxle-auth` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-19
+
+### Added
+
+- **Flexible identity — sign in with a username, not just an email.** A new
+  `identifier` setting picks how accounts are identified: `"email"` (the
+  default — every existing app is unchanged) or `"username"`. In username mode
+  `sign_up` / `sign_in` take a `username`, no email is required, and the
+  email-only flows (verification, password reset) simply go unused. The
+  schema now carries both `email` and `username` as nullable, UNIQUE columns,
+  so an app can also collect an optional email alongside a username.
+  - **Username policy, all configurable:** length (`usernameMinLength` /
+    `usernameMaxLength`, default 3–30), an allowed-character `usernamePattern`
+    (default `^[a-z0-9_-]+$`), and a **reserved-name block-list** (≈90 names —
+    system/staff identities and common routes like `/login`, `/api`,
+    `/settings` — to prevent impersonation and route collisions). Usernames are
+    lowercase-normalised, so uniqueness is case-insensitive on every backend.
+  - **`AuthService.username_available(name)`** and a public
+    `GET {authPathPrefix}/username-available?u=` endpoint (username mode). A
+    handle's availability is intentionally discoverable — a user must know
+    whether it's free before claiming it — while sign-in stays enumeration-safe
+    (a missing/malformed handle is an ordinary `InvalidCredentials`).
+  - The credential endpoints (`/login`, `/signup`, JWT `/token`), the
+    `window.__PYXLE_AUTH__` SSR seed, and `useAuth()` use the configured field;
+    the seed publishes the `identifier` mode so the client renders the right
+    input. `user.username` is included in `request.user` and `/me`.
+- **Per-identifier rate limiting.** The sign-in limiter keys on the configured
+  identifier (email or username) instead of email specifically.
+
+### Changed
+
+- `users.email` is now **nullable** (was `NOT NULL`) and `users.username` is
+  added (nullable, UNIQUE). Migration `0004-flexible-identity` applies this in
+  place on PostgreSQL/MySQL and via a session-preserving table rebuild on
+  SQLite — **no login is lost**. Backward compatible: existing email-mode apps
+  need no changes and `email` keeps its UNIQUE constraint.
+- `User.email` is now `str | None` and `User` gains `username: str | None`.
+
 ## [0.3.0] - 2026-06-17
 
 ### Added

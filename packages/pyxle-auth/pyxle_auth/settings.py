@@ -9,8 +9,11 @@ doesn't spend half a second hashing passwords per test.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
+
+from ._identity import DEFAULT_RESERVED_USERNAMES
 
 
 # ---------------------------------------------------------------------------
@@ -102,9 +105,34 @@ class AuthSettings:
     rate_limit_sign_in_per_hour: int = 10
     rate_limit_sign_up_per_hour: int = 5
     rate_limit_password_reset_per_hour: int = 3
+    # Per-IP cap on the public username-availability endpoint. Generous enough
+    # for a debounced "as you type" picker, tight enough to make bulk
+    # enumeration of the user list impractical.
+    rate_limit_username_check_per_hour: int = 120
 
     # Email verification
     require_email_verified: bool = False
+
+    # ---- Identity model ----------------------------------------------------
+    # Which credential identifies a user at sign-in.
+    #   "email"    (default) — the historical behaviour; every existing app is
+    #              unaffected. Sign-up/sign-in take an email; verification and
+    #              password-reset flows are available.
+    #   "username" — a unique, lowercase username is the credential. No email
+    #              is required (apps may still collect one optionally, e.g. for
+    #              future reset); email verification / reset simply go unused.
+    # The schema carries both columns (each UNIQUE, nullable) so this is a pure
+    # config switch, and leaves room for a future "either" (login with either)
+    # mode without another migration.
+    identifier: str = "email"
+
+    # Username policy — consulted whenever a username is validated (sign-up in
+    # username mode, or any app that collects a username). Usernames are
+    # lowercase-normalised, so uniqueness is case-insensitive on every backend.
+    username_min_length: int = 3
+    username_max_length: int = 30
+    username_pattern: str = r"^[a-z0-9_-]+$"
+    username_reserved: frozenset[str] = DEFAULT_RESERVED_USERNAMES
 
     # Whether we're in a strict production posture. Currently only
     # enforces ``cookie_secure=True`` at construction time.
@@ -145,6 +173,28 @@ class AuthSettings:
             raise ValueError("rate_limit_password_reset_per_hour must be positive")
         if self.password_max_length <= self.password_min_length:
             raise ValueError("password_max_length must exceed password_min_length")
+        if self.identifier not in ("email", "username"):
+            raise ValueError(
+                f'identifier must be "email" or "username", got {self.identifier!r}'
+            )
+        if self.username_min_length < 1:
+            raise ValueError("username_min_length must be >= 1")
+        if self.username_max_length < self.username_min_length:
+            raise ValueError(
+                "username_max_length must be >= username_min_length"
+            )
+        # Fail loud at boot on an invalid username_pattern instead of crashing
+        # on the first sign-up (or the public availability endpoint) with a
+        # raw re.error. (A catastrophic-backtracking pattern is a config-author
+        # footgun, not an attacker vector — the pattern is never user input.)
+        try:
+            re.compile(self.username_pattern)
+        except re.error as exc:
+            raise ValueError(
+                f"username_pattern is not a valid regular expression: {exc}"
+            ) from exc
+        if self.rate_limit_username_check_per_hour <= 0:
+            raise ValueError("rate_limit_username_check_per_hour must be positive")
         # Argon2 strength floors (OWASP argon2id guidance). Enforced only in
         # strict mode so for_tests() can use fast/weak parameters; a real
         # deployment with a fat-fingered PYXLE_AUTH_ARGON_* env fails loudly
@@ -223,10 +273,19 @@ class AuthSettings:
             rate_limit_sign_up_per_hour=_int(
                 "PYXLE_AUTH_RL_SIGN_UP_PER_HOUR", 5
             ),
+            rate_limit_username_check_per_hour=_int(
+                "PYXLE_AUTH_RL_USERNAME_CHECK_PER_HOUR", 120
+            ),
             rate_limit_password_reset_per_hour=_int(
                 "PYXLE_AUTH_RATE_LIMIT_PASSWORD_RESET_PER_HOUR", 3
             ),
             require_email_verified=_bool("PYXLE_AUTH_REQUIRE_VERIFIED", False),
+            identifier=(
+                os.environ.get("PYXLE_AUTH_IDENTIFIER", "email").strip().lower()
+                or "email"
+            ),
+            username_min_length=_int("PYXLE_AUTH_USERNAME_MIN", 3),
+            username_max_length=_int("PYXLE_AUTH_USERNAME_MAX", 30),
             strict=strict,
         )
         if overrides:

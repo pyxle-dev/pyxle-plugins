@@ -41,6 +41,7 @@ def _make_user(user_id: str = "u1") -> User:
     return User(
         id=user_id,
         email="alice@example.com",
+        username=None,
         email_verified_at=None,
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         plan="free",
