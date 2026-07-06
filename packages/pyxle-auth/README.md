@@ -6,6 +6,10 @@ permissions, API tokens, and one-line request guards. Built on
 [pyxle-db](https://github.com/pyxle-dev/pyxle-plugins/tree/main/packages/pyxle-db),
 so the same code runs on SQLite, PostgreSQL, and MySQL. (Caveat: every query is portable across all three, but the *shipped schema files* target SQLite and PostgreSQL; MySQL needs a dialect-override migration — `0001-pyxle-auth-core.mysql.sql` — because MySQL requires key lengths on TEXT keys. On the roadmap; contributions welcome.)
 
+- **Email *or* username identity** — set `identifier` to `"email"` (default)
+  or `"username"`. Username mode needs no email: pick any available handle,
+  case-insensitive and reserved-name guarded, with a `/username-available`
+  check endpoint. (More below.)
 - **Sessions** — argon2id-hashed passwords, server-side sessions with
   sliding expiry and an absolute cap, `HttpOnly; Secure; SameSite=Lax`
   cookies.
@@ -99,6 +103,50 @@ async def endpoint(request: Request) -> JSONResponse:
 
 `sign_up` has the same shape. `sign_out(cookie_value=...)` returns a
 cookie that clears the browser's copy — set it the same way.
+
+## Identity model: email or username
+
+By default users are identified by **email**, exactly as before. To build a
+username-based app — pick any available handle, no email or phone — set
+`identifier` to `"username"` in `pyxle.config.json`:
+
+```json
+{
+  "plugins": [
+    { "name": "pyxle-db", "settings": { "path": "data/app.db" } },
+    { "name": "pyxle-auth", "settings": { "identifier": "username" } }
+  ]
+}
+```
+
+Now the credential endpoints, the `useAuth()` hook, and the services take a
+`username` instead of an `email`:
+
+```python
+user, cookie = await auth.sign_up(username="ada", password="…")   # email optional
+user           = await auth.verify_credentials(username="ADA", password="…")  # case-insensitive
+free           = await auth.username_available("ada")             # False
+```
+
+- **Normalisation:** usernames are trimmed and lowercased, so uniqueness is
+  case-insensitive on every backend (`Ada` == `ada`).
+- **Policy (configurable):** `usernameMinLength` / `usernameMaxLength`
+  (default 3–30), `usernamePattern` (default `^[a-z0-9_-]+$`), and a
+  reserved-name block-list (≈90 system/route names like `admin`, `api`,
+  `login` — override or clear it in code).
+- **Availability is public** (but **per-IP rate-limited**, so it can't be used to
+  bulk-scrape the user list): `GET {authPathPrefix}/username-available?u=<name>`
+  returns `{"available": true|false}` so a picker can show it live. Sign-in
+  stays enumeration-safe — a missing or malformed handle is just an
+  `InvalidCredentials`, never a distinct error.
+- **Optional email:** username mode may still accept an email at sign-up
+  (e.g. for a future reset) — pass both; only the configured identifier is
+  required.
+- **Multiple accounts:** there's no per-person limit — anyone can register as
+  many usernames as they like (tune `rateLimitSignUpPerHour` to taste).
+
+`email` and `username` are both nullable, UNIQUE columns, so switching modes
+is a config change, not a code rewrite. Existing email apps are untouched.
 
 ## Bring your own mailer
 
@@ -235,8 +283,14 @@ Precedence: plugin `settings` in `pyxle.config.json` **>**
 | `emailVerifyTtlSeconds` | `PYXLE_AUTH_EMAIL_VERIFY_TTL_SECONDS` | `86400` (24 h) | Verify-token lifetime |
 | `rateLimitSignInPerHour` | `PYXLE_AUTH_RL_SIGN_IN_PER_HOUR` | `10` | Per IP and per email |
 | `rateLimitSignUpPerHour` | `PYXLE_AUTH_RL_SIGN_UP_PER_HOUR` | `5` | Per IP |
+| `rateLimitUsernameCheckPerHour` | `PYXLE_AUTH_RL_USERNAME_CHECK_PER_HOUR` | `120` | Per IP, on `/username-available` |
 | `rateLimitPasswordResetPerHour` | `PYXLE_AUTH_RATE_LIMIT_PASSWORD_RESET_PER_HOUR` | `3` | Per email and per IP |
 | `requireEmailVerified` | `PYXLE_AUTH_REQUIRE_VERIFIED` | `false` | Gate sign-in on verification |
+| `identifier` | `PYXLE_AUTH_IDENTIFIER` | `email` | Login identity: `email` or `username` |
+| `usernameMinLength` | `PYXLE_AUTH_USERNAME_MIN` | `3` | Min username length (username mode) |
+| `usernameMaxLength` | `PYXLE_AUTH_USERNAME_MAX` | `30` | Max username length (username mode) |
+| `usernamePattern` | — | `^[a-z0-9_-]+$` | Allowed characters (matched after lowercasing) |
+| `usernameReserved` | — | ≈90 names | Reserved-username block-list (override in code) |
 | `strict` | — | `true` | Enforce `cookieSecure=true`; set `false` for HTTP dev servers |
 
 Outside the plugin, load the same configuration with
@@ -246,22 +300,30 @@ test suites — it drops argon costs and TTLs so suites stay fast.
 ## Schema
 
 The plugin owns its tables (`users`, `sessions`, `auth_tokens`,
-`api_tokens`, `roles`, `user_roles`, `ratelimit_buckets`): bundled
-migrations are applied through `pyxle_db.Migrator` at startup, followed
-by each service's idempotent `ensure_schema()`. Repeated startups are
-no-ops. The SQL is portable qmark style throughout, so the plugin works
+`api_tokens`, `roles`, `user_roles`, `ratelimit_buckets`, plus
+`oauth_identities` and `jwt_refresh_tokens` when those features are on):
+bundled migrations are applied through `pyxle_db.Migrator` at startup,
+followed by each service's idempotent `ensure_schema()`. Repeated startups
+are no-ops. The SQL is portable qmark style throughout, so the plugin works
 on every pyxle-db backend without per-database configuration.
+
+`users.email` and `users.username` are both nullable, UNIQUE columns (an
+account has whichever identifier its app configures). Migration
+`0004-flexible-identity` adds `username` and relaxes `email` to nullable —
+in place on PostgreSQL/MySQL, and via a session-preserving table rebuild on
+SQLite — so upgrading from 0.3.x keeps every account and live session.
 
 ## Roadmap
 
 Honest status — these are **not implemented yet**:
 
-- OAuth / OIDC sign-in (Google, GitHub, generic OIDC)
 - Multi-factor authentication (TOTP, WebAuthn)
+- "Either" identity mode (sign in with email *or* username interchangeably —
+  the schema already supports it; only the resolver/UI wiring is pending)
 
 If you need them today, the building blocks (sessions, `TokenService`,
 guards) compose underneath whatever you bring; contributions are
-welcome.
+welcome. (OAuth/OIDC sign-in and JWT access/refresh tokens shipped in 0.3.0.)
 
 ## License
 

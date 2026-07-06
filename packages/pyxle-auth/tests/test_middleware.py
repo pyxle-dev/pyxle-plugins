@@ -27,7 +27,7 @@ from starlette.responses import JSONResponse, Response
 
 from pyxle.plugins import PluginContext
 
-from pyxle_auth import AuthService
+from pyxle_auth import AuthService, AuthSettings
 from pyxle_auth.middleware import AuthSessionMiddleware, user_to_json
 
 Handler = Callable[[Request], Awaitable[Response]]
@@ -831,6 +831,7 @@ def test_user_to_json_marks_verified_email() -> None:
     verified = User(
         id="u1",
         email="bob@example.com",
+        username=None,
         email_verified_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
         plan="pro",
@@ -839,7 +840,112 @@ def test_user_to_json_marks_verified_email() -> None:
     assert out == {
         "id": "u1",
         "email": "bob@example.com",
+        "username": None,
         "emailVerified": True,
         "plan": "pro",
         "createdAt": "2026-01-01T00:00:00+00:00",
     }
+
+
+# ---------------------------------------------------------------------------
+# Username-mode endpoints (flexible identity, 0.4.0)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def username_auth(db: Any) -> AuthService:
+    svc = AuthService(
+        db, AuthSettings(strict=False, identifier="username").for_tests()
+    )
+    await svc.ensure_schema()
+    return svc
+
+
+async def _reject_call_next(request: Request) -> Response:  # pragma: no cover
+    raise AssertionError("auth endpoint must terminate in the middleware")
+
+
+async def test_signup_via_username_endpoint(
+    username_auth: AuthService, middleware: _DriveMiddleware
+) -> None:
+    ctx = _ctx(username_auth)
+    resp = await middleware.dispatch(
+        _request_json(
+            ctx,
+            path="/auth/signup",
+            body={"username": "Ada", "password": "correct horse battery"},
+        ),
+        _reject_call_next,
+    )
+    assert resp.status_code == 201
+    payload = _body(resp)
+    assert payload["user"]["username"] == "ada"
+    assert payload["user"]["email"] is None
+    assert "pyxle_session=" in resp.headers["set-cookie"]
+
+
+async def test_signup_username_endpoint_requires_username_field(
+    username_auth: AuthService, middleware: _DriveMiddleware
+) -> None:
+    ctx = _ctx(username_auth)
+    resp = await middleware.dispatch(
+        _request_json(
+            ctx,
+            path="/auth/signup",
+            body={"email": "x@y.com", "password": "correct horse battery"},
+        ),
+        _reject_call_next,
+    )
+    assert resp.status_code == 400  # the configured identifier ('username') is missing
+
+
+async def test_login_via_username_endpoint_is_case_insensitive(
+    username_auth: AuthService, middleware: _DriveMiddleware
+) -> None:
+    await username_auth.sign_up(username="ada", password="correct horse battery")
+    ctx = _ctx(username_auth)
+    resp = await middleware.dispatch(
+        _request_json(
+            ctx,
+            path="/auth/login",
+            body={"username": "ADA", "password": "correct horse battery"},
+        ),
+        _reject_call_next,
+    )
+    assert resp.status_code == 200
+    assert _body(resp)["user"]["username"] == "ada"
+
+
+async def test_username_available_endpoint(
+    username_auth: AuthService, middleware: _DriveMiddleware
+) -> None:
+    await username_auth.sign_up(username="taken", password="correct horse battery")
+    ctx = _ctx(username_auth)
+    app = SimpleNamespace(state=SimpleNamespace(pyxle_plugins=ctx))
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    def get(query: bytes) -> Request:
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/auth/username-available",
+            "headers": [],
+            "query_string": query,
+            "client": ("203.0.113.9", 5555),
+            "app": app,
+            "state": {},
+        }
+        return Request(scope, receive)
+
+    r_free = await middleware.dispatch(get(b"u=freehandle"), _reject_call_next)
+    assert r_free.status_code == 200
+    assert _body(r_free)["available"] is True
+
+    r_taken = await middleware.dispatch(get(b"u=taken"), _reject_call_next)
+    assert _body(r_taken)["available"] is False
+
+    r_reserved = await middleware.dispatch(get(b"u=admin"), _reject_call_next)
+    body = _body(r_reserved)
+    assert body["available"] is False and "reserved" in body.get("reason", "").lower()

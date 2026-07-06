@@ -122,8 +122,13 @@ _SETTINGS_MAP: Mapping[str, str] = {
     "emailVerifyTtlSeconds": "email_verify_ttl_seconds",
     "rateLimitSignInPerHour": "rate_limit_sign_in_per_hour",
     "rateLimitSignUpPerHour": "rate_limit_sign_up_per_hour",
+    "rateLimitUsernameCheckPerHour": "rate_limit_username_check_per_hour",
     "rateLimitPasswordResetPerHour": "rate_limit_password_reset_per_hour",
     "requireEmailVerified": "require_email_verified",
+    "identifier": "identifier",
+    "usernameMinLength": "username_min_length",
+    "usernameMaxLength": "username_max_length",
+    "usernamePattern": "username_pattern",
     "strict": "strict",
 }
 

@@ -7,7 +7,7 @@
     @server
     async def load(request):
         user = await require_user_page(request)          # 401 LoaderError when signed out
-        return {"email": user.email}
+        return {"id": user.id, "name": user.username or user.email}
 
     @action
     async def save(request):

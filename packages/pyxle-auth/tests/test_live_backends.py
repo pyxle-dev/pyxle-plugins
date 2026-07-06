@@ -114,7 +114,41 @@ async def test_schema_applies_and_is_idempotent(live_db: Database, services) -> 
         "0001-pyxle-auth-core",
         "0002-oauth-identities",
         "0003-jwt-refresh-tokens",
+        "0004-flexible-identity",
     ]
+
+
+async def test_username_mode_lifecycle(live_db: Database) -> None:  # type: ignore[no-untyped-def]
+    """The 0004 migration + username auth on a real engine: apply the schema,
+    then sign up and sign in by username (no email) end-to-end.
+
+    Exercises the per-dialect ``0004`` migration (nullable email + UNIQUE
+    username) on the live PostgreSQL/MySQL servers — the same path the SQLite
+    suite covers — and proves username mode round-trips through the real DB.
+    """
+    settings = AuthSettings(strict=False, identifier="username").for_tests()
+    auth = AuthService(live_db, settings)
+    rbac = RoleService(live_db)
+    tokens = TokenService(live_db)
+    api_tokens = ApiTokenService(live_db)
+    await _apply_schema(live_db, (auth, rbac, tokens, api_tokens))
+
+    import uuid
+
+    handle = f"user_{uuid.uuid4().hex[:12]}"
+    user, cookie = await auth.sign_up(username=handle, password="correct horse staple")
+    assert user.username == handle and user.email is None
+    assert (await auth.resolve_session(cookie_value=cookie.value)).id == user.id
+
+    # Case-insensitive sign-in by username; no email anywhere.
+    _, fresh = await auth.sign_in(username=handle.upper(), password="correct horse staple")
+    assert fresh.value
+    with pytest.raises(InvalidCredentials):
+        await auth.sign_in(username=handle, password="wrong password entirely")
+
+    # Username uniqueness is enforced by the live DB's UNIQUE(username).
+    assert await auth.username_available(handle) is False
+    assert await auth.username_available(f"free_{uuid.uuid4().hex[:8]}") is True
 
 
 async def test_full_account_lifecycle(live_db: Database, services) -> None:  # type: ignore[no-untyped-def]
