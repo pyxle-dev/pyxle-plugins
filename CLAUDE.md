@@ -10,12 +10,13 @@ Each plugin is an independent Python package under `packages/`:
 
 ```
 packages/
-|-- pyxle-auth/            # Authentication plugin (planned)
+|-- pyxle-auth/            # Authentication plugin
 |   |-- pyproject.toml
 |   |-- pyxle_auth/
 |   |   +-- __init__.py
 |   +-- tests/
-|-- pyxle-db/              # Database plugin (planned)
+|-- pyxle-db/              # Database plugin
+|-- pyxle-mail/            # Email plugin
 +-- ...
 ```
 
