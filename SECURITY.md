@@ -14,7 +14,12 @@ Both packages are pre-1.0: we fix forward rather than backporting.
 
 **Please do not open a public issue for security reports.**
 
-Email **security@pyxle.dev** with:
+Report privately through either channel:
+
+- **GitHub private advisory (preferred):** [Report a vulnerability](https://github.com/pyxle-dev/pyxle-plugins/security/advisories/new) — this opens a private thread with the maintainers.
+- **Email:** **security@pyxle.dev**
+
+Please include:
 
 - The affected package and version.
 - A description of the issue and its impact.
