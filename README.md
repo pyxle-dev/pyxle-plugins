@@ -5,6 +5,7 @@ Official plugins for the [Pyxle](https://pyxle.dev) framework — one repo, inde
 [![CI](https://github.com/pyxle-dev/pyxle-plugins/actions/workflows/ci.yml/badge.svg)](https://github.com/pyxle-dev/pyxle-plugins/actions/workflows/ci.yml)
 [![pyxle-db on PyPI](https://img.shields.io/pypi/v/pyxle-db?label=pyxle-db)](https://pypi.org/project/pyxle-db/)
 [![pyxle-auth on PyPI](https://img.shields.io/pypi/v/pyxle-auth?label=pyxle-auth)](https://pypi.org/project/pyxle-auth/)
+[![pyxle-mail on PyPI](https://img.shields.io/pypi/v/pyxle-mail?label=pyxle-mail)](https://pypi.org/project/pyxle-mail/)
 
 ## Packages
 
@@ -12,12 +13,15 @@ Official plugins for the [Pyxle](https://pyxle.dev) framework — one repo, inde
 |---|---|---|
 | [`pyxle-db`](packages/pyxle-db) | One explicit-SQL API over SQLite, PostgreSQL, and MySQL: portable `?` placeholders, a uniform `Row`, checksum-tracked migrations, and the `DatabaseLike` contract other plugins build on. Not an ORM, on purpose. | [pyxle.dev/docs/plugins/pyxle-db](https://pyxle.dev/docs/plugins/pyxle-db) |
 | [`pyxle-auth`](packages/pyxle-auth) | Email + password accounts with argon2id, sliding sessions, password-reset / email-verification flows, RBAC with wildcards, scoped API tokens, and request guards. Brings no UI and sends no email — hardened primitives only. | [pyxle.dev/docs/plugins/pyxle-auth](https://pyxle.dev/docs/plugins/pyxle-auth) |
+| [`pyxle-mail`](packages/pyxle-mail) | Email through one `mail.service` over SMTP, Resend, or any `MailProvider` contract — swap providers by config, not code. With no configuration it logs instead of sending, so local dev needs zero setup. | [pyxle.dev/docs/plugins/pyxle-mail](https://pyxle.dev/docs/plugins/pyxle-mail) |
 
 ```bash
 pip install pyxle-db                # SQLite needs nothing else
 pip install "pyxle-db[postgres]"    # + asyncpg
 pip install "pyxle-db[mysql]"       # + asyncmy, cryptography
 pip install pyxle-auth              # pulls in pyxle-db
+pip install pyxle-mail              # SMTP + dev "log instead of send"
+pip install "pyxle-mail[resend]"    # + Resend HTTP API
 ```
 
 Wire them up in `pyxle.config.json` and they handle their own lifecycle at
@@ -57,7 +61,9 @@ packages/
 │   ├── CHANGELOG.md   #   own release history
 │   ├── pyxle_db/      #   source (py.typed)
 │   └── tests/         #   own suite, incl. live-server conformance tests
-└── pyxle-auth/
+├── pyxle-auth/
+│   └── …same shape
+└── pyxle-mail/
     └── …same shape
 ```
 
@@ -65,11 +71,12 @@ packages/
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e "packages/pyxle-db[sqlalchemy,postgres,mysql,dev]" -e "packages/pyxle-auth[dev]"
+pip install -e "packages/pyxle-db[sqlalchemy,postgres,mysql,dev]" -e "packages/pyxle-auth[dev]" -e "packages/pyxle-mail[resend,dev]"
 
 # unit + SQLite suites
 (cd packages/pyxle-db && pytest)
 (cd packages/pyxle-auth && pytest)
+(cd packages/pyxle-mail && pytest)
 
 # the live-server suites run when these are set (CI always sets them):
 export PYXLE_DB_TEST_POSTGRES_URL=postgresql://user:pass@127.0.0.1:5432/pyxle_test

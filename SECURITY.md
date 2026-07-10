@@ -3,12 +3,13 @@
 ## Supported versions
 
 Only the latest released version of each package receives security fixes.
-Both packages are pre-1.0: we fix forward rather than backporting.
+All packages are pre-1.0: we fix forward rather than backporting.
 
 | Package      | Supported          |
 | ------------ | ------------------ |
 | `pyxle-db`   | latest release     |
 | `pyxle-auth` | latest release     |
+| `pyxle-mail` | latest release     |
 
 ## Reporting a vulnerability
 
