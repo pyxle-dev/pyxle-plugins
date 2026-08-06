@@ -35,3 +35,6 @@ Thumbs.db
 
 # Tooling caches
 .ruff_cache/
+
+# macOS AppleDouble metadata files
+._*
