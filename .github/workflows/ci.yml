@@ -16,7 +16,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # Pinned deliberately: an unpinned install takes whatever ruff is
+      # newest, so a release that adds rules turns this gate red with no
+      # change to the code (0.16 raised 126 findings on an untouched tree).
+      # Matches the framework repo's dev pin; bump it as its own change,
+      # together with the findings the new version reports.
+      - run: pip install "ruff>=0.6,<0.7"
       - run: ruff check packages/pyxle-db/pyxle_db packages/pyxle-auth/pyxle_auth packages/pyxle-mail/pyxle_mail
 
   test:
