@@ -67,6 +67,7 @@ from typing import Any, Mapping, Sequence
 from pyxle.plugins import PluginContext, PyxlePlugin
 
 from pyxle_db import Database, connect
+from pyxle_db._version import __version__
 from pyxle_db.errors import ConfigurationError
 from pyxle_db.url import parse_database_url
 
@@ -78,7 +79,7 @@ _ENV_PREFIX = "env:"
 
 class PyxleDbPlugin(PyxlePlugin):
     name = "pyxle-db"
-    version = "0.3.0"
+    version = __version__
 
     def middleware(self) -> Sequence[tuple[str, Mapping[str, Any]]]:
         """Inject ``request.state.db`` and manage per-request transactions.

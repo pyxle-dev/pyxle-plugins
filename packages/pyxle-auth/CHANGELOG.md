@@ -5,6 +5,39 @@ All notable changes to `pyxle-auth` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-08-22
+
+### Fixed
+
+- **The session cookie is only marked `Secure` when the request actually
+  arrived over HTTPS.** A browser *discards* a `Secure` cookie delivered over
+  plain HTTP, so on any plain-HTTP deployment sign-in appeared to succeed —
+  the endpoint returned `200`, the redirect fired — and the user landed back
+  on the sign-in page with **no error at all**, because nothing had failed.
+  Self-hosted installs hit this constantly: a LAN address, a homelab, a
+  private network, or a proxy that terminates TLS without sending
+  `X-Forwarded-Proto`. HTTPS deployments are unchanged, that header is
+  honoured, and dropping the flag over HTTP costs nothing — a connection with
+  no confidentiality has no cookie confidentiality to protect. `HttpOnly` and
+  `SameSite` are untouched. New: `SessionCookie.for_request(request)`.
+
+## [0.4.1] - 2026-08-10
+
+### Added
+
+- `enableSignup` (env `PYXLE_AUTH_ENABLE_SIGNUP`, default `true`) closes
+  self-registration while sign-in keeps working — previously the only way to
+  stop `POST /auth/signup` was `enableCredentialsApi: false`, which took
+  `POST /auth/login` with it. In username mode `GET /auth/username-available`
+  closes alongside it, and the SSR endpoint seed omits both, so a client
+  building its form from the seed won't render a signup box that leads nowhere.
+
+### Fixed
+
+- The plugin reported `version = "0.3.0"` on 0.4.0. Both the package
+  `__version__` and `PyxleAuthPlugin.version` now read the installed
+  distribution metadata, so neither can drift from `pyproject.toml` again.
+
 ## [0.4.0] - 2026-06-19
 
 ### Added

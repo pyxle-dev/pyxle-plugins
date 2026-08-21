@@ -38,6 +38,7 @@ resend = [
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
+  "pytest-cov>=5.0",
 ]
 
 [project.urls]
@@ -51,3 +52,37 @@ packages = ["pyxle_mail"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Coverage runs by default so the floor is enforced wherever the suite runs, not
+# only in CI — a gate you cannot reproduce locally is a gate you discover in a
+# pull request. Pass --no-cov when running a single test for a quick loop.
+addopts = "--cov=pyxle_mail --cov-branch --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+source = ["pyxle_mail"]
+
+[tool.coverage.report]
+# ---------------------------------------------------------------------------
+# THE FLOOR ONLY MOVES UP.
+#
+# Measured 95.8435% on 2026-08-18 (branch coverage). The project-wide target is 95%; this package closes that gap
+# in the first post-launch release. What is written here is what is true and
+# enforced today, which is worth more than a target no one ever measured — this
+# gate had never been wired at all before, and both numbers below 95% were
+# discovered only when someone finally ran it.
+#
+# Raising it: improve coverage, read the new TOTAL, put it here in the same
+# change. That is the only edit to this line that needs no explanation.
+#
+# Lowering it: needs a reason stated in the pull request. It is not a knob for
+# turning a red build green — if coverage dropped, the tests that used to cover
+# that code are the thing to look at.
+#
+# This package needs no database engines. Its one conditional suite is the live
+# SMTP round trip (PYXLE_MAIL_TEST_SMTP_HOST, e.g. Mailpit), which CI does not
+# require and which does not affect this floor. See the README's "Coverage
+# floors" section.
+# ---------------------------------------------------------------------------
+fail_under = 95.8
+precision = 2
+show_missing = true

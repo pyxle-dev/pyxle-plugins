@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-auth"
-version = "0.4.0"
+version = "0.4.2"
 description = "Authentication plugin for Pyxle: email- or username-based identity, argon2id sessions, password reset and email verification flows, RBAC, scoped API tokens, and request guards."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -45,6 +45,7 @@ jwt = [
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
+  "pytest-cov>=5.0",
   "httpx>=0.24",
   "pyjwt>=2.4",
 ]
@@ -62,3 +63,39 @@ packages = ["pyxle_auth"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Coverage runs by default so the floor is enforced wherever the suite runs, not
+# only in CI — a gate you cannot reproduce locally is a gate you discover in a
+# pull request. Pass --no-cov when running a single test for a quick loop.
+addopts = "--cov=pyxle_auth --cov-branch --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+source = ["pyxle_auth"]
+
+[tool.coverage.report]
+# ---------------------------------------------------------------------------
+# THE FLOOR ONLY MOVES UP.
+#
+# Measured 92.3956% on 2026-08-18 (branch coverage, live PostgreSQL + MySQL
+# engines running). The project-wide target is 95%; this package closes that gap
+# in the first post-launch release. What is written here is what is true and
+# enforced today, which is worth more than a target no one ever measured — this
+# gate had never been wired at all before, and both numbers below 95% were
+# discovered only when someone finally ran it.
+#
+# Raising it: improve coverage, read the new TOTAL, put it here in the same
+# change. That is the only edit to this line that needs no explanation.
+#
+# Lowering it: needs a reason stated in the pull request. It is not a knob for
+# turning a red build green — if coverage dropped, the tests that used to cover
+# that code are the thing to look at.
+#
+# Measured with the live PostgreSQL + MySQL engines running. Without them the
+# schema-portability and account-lifecycle suites skip and their coverage goes
+# with them, so the run lands below this floor. That is the gate telling the
+# truth: a skipped suite is not a passing suite. See the README's "Coverage
+# floors" section.
+# ---------------------------------------------------------------------------
+fail_under = 92.3
+precision = 2
+show_missing = true

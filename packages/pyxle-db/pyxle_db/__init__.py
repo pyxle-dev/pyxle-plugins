@@ -28,6 +28,7 @@ Design constraints:
 
 from __future__ import annotations
 
+from pyxle_db._version import __version__
 from pyxle_db.autotx import no_auto_transaction
 from pyxle_db.backends import Dialect
 from pyxle_db.contract import DatabaseLike, TransactionLike
@@ -71,6 +72,7 @@ def get_database() -> Database:
 
 
 __all__ = [
+    "__version__",
     "Database",
     "DatabaseLike",
     "Transaction",
@@ -93,5 +95,3 @@ __all__ = [
     "get_database",
     "no_auto_transaction",
 ]
-
-__version__ = "0.3.0"

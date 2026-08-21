@@ -53,6 +53,10 @@ class AuthSettings:
             endpoints under. Default ``/auth``.
         enable_credentials_api: Serve ``POST {prefix}/login`` and
             ``POST {prefix}/signup``. Default ``True``.
+        enable_signup: Serve ``POST {prefix}/signup`` (and, for username
+            identity, ``GET {prefix}/username-available``). Default ``True``.
+            Set ``False`` for an invite-only or single-operator app: sign-in
+            keeps working, self-registration does not.
         password_reset_ttl_seconds: Lifetime of a password-reset token.
             Short by design — the link sits in an inbox.
         email_verify_ttl_seconds: Lifetime of an email-verification token.
@@ -96,6 +100,13 @@ class AuthSettings:
     # to roll your own sign-in/sign-up actions — ``/me`` and ``/logout`` stay
     # available either way.
     enable_credentials_api: bool = True
+
+    # Whether ``POST {prefix}/signup`` is served. Independent of the flag above
+    # so an app can keep sign-in while closing self-registration — an
+    # invite-only tool, an internal dashboard, a status page whose only
+    # accounts are its operators. Turning the credentials API off disables
+    # signup regardless; this narrows it without taking login with it.
+    enable_signup: bool = True
 
     # Token lifetimes (password reset / email verification)
     password_reset_ttl_seconds: int = 1800       # 30 minutes
@@ -261,6 +272,7 @@ class AuthSettings:
             enable_credentials_api=_bool(
                 "PYXLE_AUTH_ENABLE_CREDENTIALS_API", True
             ),
+            enable_signup=_bool("PYXLE_AUTH_ENABLE_SIGNUP", True),
             password_reset_ttl_seconds=_int(
                 "PYXLE_AUTH_PASSWORD_RESET_TTL_SECONDS", 1800
             ),

@@ -5,6 +5,14 @@ All notable changes to `pyxle-db` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `__version__` and the plugin's `version` are read from installed distribution
+  metadata instead of restated in source, so they cannot drift from
+  `pyproject.toml`.
+
 ## [0.3.0] - 2026-06-17
 
 Enterprise database support. All additive — no breaking changes.

@@ -49,6 +49,7 @@ mysql = [
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
+  "pytest-cov>=5.0",
 ]
 
 [project.urls]
@@ -65,6 +66,41 @@ packages = ["pyxle_db"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Coverage runs by default so the floor is enforced wherever the suite runs, not
+# only in CI — a gate you cannot reproduce locally is a gate you discover in a
+# pull request. Pass --no-cov when running a single test for a quick loop.
+addopts = "--cov=pyxle_db --cov-branch --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+source = ["pyxle_db"]
+
+[tool.coverage.report]
+# ---------------------------------------------------------------------------
+# THE FLOOR ONLY MOVES UP.
+#
+# Measured 92.0575% on 2026-08-18 (branch coverage, live PostgreSQL + MySQL
+# engines running). The project-wide target is 95%; this package closes that gap
+# in the first post-launch release. What is written here is what is true and
+# enforced today, which is worth more than a target no one ever measured — this
+# gate had never been wired at all before, and both numbers below 95% were
+# discovered only when someone finally ran it.
+#
+# Raising it: improve coverage, read the new TOTAL, put it here in the same
+# change. That is the only edit to this line that needs no explanation.
+#
+# Lowering it: needs a reason stated in the pull request. It is not a knob for
+# turning a red build green — if coverage dropped, the tests that used to cover
+# that code are the thing to look at.
+#
+# Measured with the live PostgreSQL + MySQL engines running. Without them the
+# live suites skip -- 116 tests here -- and their coverage goes with them, so
+# the run lands below this floor. That is the gate telling the truth: a skipped
+# suite is not a passing suite. See the README's "Coverage floors" section.
+# ---------------------------------------------------------------------------
+fail_under = 92.0
+precision = 2
+show_missing = true
 
 [tool.ruff.lint.per-file-ignores]
 # The dialect-specific backend tests guard their imports behind
