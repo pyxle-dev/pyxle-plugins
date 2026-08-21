@@ -52,6 +52,10 @@ the built-in default. All keys are optional:
   endpoints under. Default ``/auth``.
 * ``enableCredentialsApi`` — serve ``POST {prefix}/login`` and
   ``POST {prefix}/signup``. Default ``True``.
+* ``enableSignup`` — serve ``POST {prefix}/signup``. Default ``True``. Set
+  ``False`` to close self-registration while sign-in keeps working: an
+  invite-only app, an internal tool, a status page whose only accounts are
+  its operators.
 * ``sessionTtlSeconds`` — sliding session lifetime. Default 30d.
 * ``sessionAbsoluteMaxSeconds`` — hard cap. Default 90d.
 * ``passwordResetTtlSeconds`` — reset-token lifetime. Default 1800.
@@ -84,6 +88,7 @@ from pyxle.plugins import PluginContext, PluginServiceError, PyxlePlugin
 
 from pyxle_db import DatabaseLike, Migrator
 
+from pyxle_auth._version import __version__
 from pyxle_auth.api_tokens import ApiTokenService
 from pyxle_auth.rbac import RoleService
 from pyxle_auth.service import AuthService
@@ -118,6 +123,7 @@ _SETTINGS_MAP: Mapping[str, str] = {
     "cookiePath": "cookie_path",
     "authPathPrefix": "auth_path_prefix",
     "enableCredentialsApi": "enable_credentials_api",
+    "enableSignup": "enable_signup",
     "passwordResetTtlSeconds": "password_reset_ttl_seconds",
     "emailVerifyTtlSeconds": "email_verify_ttl_seconds",
     "rateLimitSignInPerHour": "rate_limit_sign_in_per_hour",
@@ -141,7 +147,7 @@ class _SchemaOwner(Protocol):
 
 class PyxleAuthPlugin(PyxlePlugin):
     name = "pyxle-auth"
-    version = "0.3.0"
+    version = __version__
 
     def middleware(self) -> Sequence[tuple[str, Mapping[str, Any]]]:
         """Contribute the OAuth + session middleware.

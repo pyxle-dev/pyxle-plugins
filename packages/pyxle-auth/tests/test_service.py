@@ -563,3 +563,66 @@ async def test_migration_file_bootstraps_full_schema(
         ) == []
     finally:
         await db.aclose()
+
+
+class TestTheSecureFlagFollowsTheConnection:
+    """A `Secure` cookie is discarded by the browser over plain HTTP.
+
+    Setting it there does not protect anything — a connection with no
+    confidentiality has no cookie confidentiality to lose — but it does mean no
+    session cookie is stored at all. The user signs in successfully, is
+    redirected, has no session, and is returned to the sign-in page **with no
+    error**. Self-hosted deployments hit this constantly: a LAN address, a
+    homelab, anything behind a proxy that omits `X-Forwarded-Proto`.
+    """
+
+    @staticmethod
+    def _cookie():
+        from pyxle_auth.models import SessionCookie
+
+        return SessionCookie(name="s", value="v", max_age=60, secure=True)
+
+    @staticmethod
+    def _request(scheme="http", headers=None):
+        class _Url:
+            def __init__(self, scheme):
+                self.scheme = scheme
+
+        class _Request:
+            def __init__(self, scheme, headers):
+                self.url = _Url(scheme)
+                self.headers = headers or {}
+
+        return _Request(scheme, headers)
+
+    def test_plain_http_drops_the_flag_so_the_cookie_survives(self):
+        assert self._cookie().for_request(self._request("http")).secure is False
+
+    def test_https_keeps_it(self):
+        assert self._cookie().for_request(self._request("https")).secure is True
+
+    def test_a_tls_terminating_proxy_is_believed(self):
+        """The common production shape: the browser spoke HTTPS, the proxy
+        speaks plain HTTP to us, and the scheme alone would say otherwise."""
+        request = self._request("http", {"x-forwarded-proto": "https"})
+        assert self._cookie().for_request(request).secure is True
+
+    def test_a_forwarded_chain_reads_the_first_hop(self):
+        request = self._request("http", {"x-forwarded-proto": "https, http"})
+        assert self._cookie().for_request(request).secure is True
+
+    def test_a_cookie_that_was_never_secure_is_returned_unchanged(self):
+        from pyxle_auth.models import SessionCookie
+
+        cookie = SessionCookie(name="s", value="v", max_age=60, secure=False)
+        assert cookie.for_request(self._request("https")) is cookie
+
+    def test_nothing_else_about_the_cookie_changes(self):
+        """Downgrading Secure must not quietly drop HttpOnly or SameSite —
+        those are the flags actually protecting the session here."""
+        downgraded = self._cookie().for_request(self._request("http"))
+
+        assert downgraded.http_only is True
+        assert downgraded.samesite == "Lax"
+        assert downgraded.value == "v"
+        assert downgraded.max_age == 60

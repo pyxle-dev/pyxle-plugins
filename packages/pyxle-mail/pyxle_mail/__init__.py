@@ -20,6 +20,7 @@ provider (SMTP or Resend, or any :class:`MailProvider`) for real delivery.
 
 from __future__ import annotations
 
+from pyxle_mail._version import __version__
 from pyxle_mail.contract import MailProvider
 from pyxle_mail.errors import InvalidMessage, MailConfigError, MailError, SendError
 from pyxle_mail.models import EmailMessage, SendResult
@@ -28,6 +29,7 @@ from pyxle_mail.service import MailService, get_mail_service
 from pyxle_mail.settings import MailSettings
 
 __all__ = [
+    "__version__",
     "MailProvider",
     "MailService",
     "MailSettings",
@@ -42,5 +44,3 @@ __all__ = [
     "SendError",
     "get_mail_service",
 ]
-
-__version__ = "0.1.0"

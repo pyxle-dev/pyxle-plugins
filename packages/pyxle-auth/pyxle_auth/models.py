@@ -7,7 +7,7 @@ without worrying about someone silently editing the email address.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -87,6 +87,24 @@ class SessionCookie:
     path: str = "/"
     domain: str | None = None
 
+    def for_request(self, request: Any) -> "SessionCookie":
+        """This cookie, with ``Secure`` dropped when the connection is not TLS.
+
+        A browser **discards** a ``Secure`` cookie that arrives over plain
+        HTTP. Sending one there does not degrade security — there is no
+        confidentiality on the connection to protect — it simply means no
+        session cookie is stored, so the user is silently returned to the sign
+        in page with no error to read. Self-hosted deployments hit this
+        constantly: a LAN address, a homelab, a private network behind
+        WireGuard, or any proxy that terminates TLS and forgets
+        ``X-Forwarded-Proto``.
+
+        Over HTTPS — directly or per that header — the flag is untouched.
+        """
+        if not self.secure or _is_https(request):
+            return self
+        return replace(self, secure=False)
+
     def kwargs(self) -> dict[str, Any]:
         """Return a dict shaped for ``Starlette response.set_cookie``."""
         out: dict[str, Any] = {
@@ -115,6 +133,23 @@ class SessionCookie:
             path=path,
             domain=domain,
         )
+
+
+def _is_https(request: Any) -> bool:
+    """Whether *request* reached the app over TLS.
+
+    ``X-Forwarded-Proto`` first, because the overwhelmingly common production
+    shape is a proxy terminating TLS and speaking plain HTTP to the app — where
+    the request's own scheme says ``http`` and the browser's connection was
+    HTTPS throughout.
+    """
+    headers = getattr(request, "headers", None)
+    if headers is not None:
+        forwarded = headers.get("x-forwarded-proto") or ""
+        if forwarded:
+            return forwarded.split(",")[0].strip().lower() == "https"
+    url = getattr(request, "url", None)
+    return str(getattr(url, "scheme", "")).lower() in ("https", "wss")
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ Public surface:
 
 from __future__ import annotations
 
+from pyxle_auth._version import __version__
 from pyxle_auth.api_tokens import (
     TOKEN_PREFIX,
     ApiToken,
@@ -106,6 +107,7 @@ def get_auth_settings() -> AuthSettings:
 
 
 __all__ = [
+    "__version__",
     "TOKEN_PREFIX",
     "AccountExists",
     "ApiToken",
@@ -143,4 +145,3 @@ __all__ = [
     "require_user_page",
 ]
 
-__version__ = "0.3.0"

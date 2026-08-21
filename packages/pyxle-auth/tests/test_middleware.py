@@ -548,6 +548,120 @@ async def test_credentials_api_can_be_disabled(
     assert resp.status_code == 404
 
 
+async def test_signup_can_be_closed_without_closing_login(
+    db, settings, middleware: _DriveMiddleware
+) -> None:
+    """The whole point of the flag: an operator-only app still needs sign-in.
+
+    Before ``enableSignup`` existed the only way to stop self-registration was
+    ``enableCredentialsApi=False``, which took ``POST /auth/login`` with it —
+    so apps closed signup at the reverse proxy instead.
+    """
+    from dataclasses import replace
+
+    closed = replace(settings, enable_signup=False)
+    auth = AuthService(db, closed)
+    await auth.ensure_schema()
+    await auth.sign_up(email="operator@example.com", password="correct-horse-battery")
+    ctx = _ctx(closed and auth)
+
+    async def call_next(request: Request) -> Response:
+        # Unhandled by the middleware → the app answers, and has no such route.
+        return JSONResponse({"ok": False}, status_code=404)
+
+    signup = await middleware.dispatch(
+        _request_json(
+            ctx,
+            path="/auth/signup",
+            body={"email": "stranger@example.com", "password": "correct-horse-battery"},
+        ),
+        call_next,
+    )
+    assert signup.status_code == 404
+
+    login = await middleware.dispatch(
+        _request_json(
+            ctx,
+            path="/auth/login",
+            body={"email": "operator@example.com", "password": "correct-horse-battery"},
+        ),
+        call_next,
+    )
+    assert login.status_code == 200
+    assert _body(login)["ok"] is True
+
+
+async def test_closing_signup_also_closes_the_username_oracle(
+    db, settings, middleware: _DriveMiddleware
+) -> None:
+    """``/username-available`` only serves a signup form.
+
+    Left open with signup closed it is a standing answer to "does this account
+    exist?" for an app that has no way to create one.
+    """
+    from dataclasses import replace
+
+    closed = replace(settings, identifier="username", enable_signup=False)
+    auth = AuthService(db, closed)
+    await auth.ensure_schema()
+    ctx = _ctx(auth)
+
+    async def call_next(request: Request) -> Response:
+        return JSONResponse({"ok": False}, status_code=404)
+
+    resp = await middleware.dispatch(
+        _request(ctx, path="/auth/username-available"), call_next
+    )
+    assert resp.status_code == 404
+
+
+async def test_scope_seed_omits_signup_when_closed(
+    db, settings, middleware: _DriveMiddleware
+) -> None:
+    """A client rendering from the endpoint map must not offer a dead form."""
+    from dataclasses import replace
+
+    closed = replace(settings, identifier="username", enable_signup=False)
+    auth = AuthService(db, closed)
+    await auth.ensure_schema()
+    ctx = _ctx(auth)
+    captured: dict = {}
+
+    async def call_next(request: Request) -> Response:
+        captured["seed"] = request.scope.get("pyxle.auth")
+        return JSONResponse({"ok": True})
+
+    await middleware.dispatch(_request(ctx, path="/dashboard"), call_next)
+    endpoints = captured["seed"]["endpoints"]
+    assert "signup" not in endpoints
+    assert "usernameAvailable" not in endpoints
+    assert endpoints["login"] == "/auth/login"  # sign-in stays advertised
+
+
+async def test_signup_is_open_by_default(
+    db, settings, middleware: _DriveMiddleware
+) -> None:
+    """Adding the flag must not change any existing app's behaviour."""
+    assert settings.enable_signup is True
+    auth = AuthService(db, settings)
+    await auth.ensure_schema()
+    ctx = _ctx(auth)
+
+    async def call_next(request: Request) -> Response:  # pragma: no cover - not reached
+        return JSONResponse({"ok": False}, status_code=404)
+
+    resp = await middleware.dispatch(
+        _request_json(
+            ctx,
+            path="/auth/signup",
+            body={"email": "newcomer@example.com", "password": "correct-horse-battery"},
+        ),
+        call_next,
+    )
+    assert resp.status_code == 201
+    assert _body(resp)["ok"] is True
+
+
 # ---------------------------------------------------------------------------
 # JWT token endpoints (POST /token, /token/refresh)
 

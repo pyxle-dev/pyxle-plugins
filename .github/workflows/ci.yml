@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # The framework moves between plugin changes, so the pre-release signal has
+    # to run on a clock as well — otherwise a framework change that breaks a
+    # plugin sits undetected until someone happens to touch this repo.
+    - cron: "0 6 * * *"
 
 permissions:
   contents: read
@@ -24,12 +29,50 @@ jobs:
       - run: pip install "ruff>=0.6,<0.7"
       - run: ruff check packages/pyxle-db/pyxle_db packages/pyxle-auth/pyxle_auth packages/pyxle-mail/pyxle_mail
 
+  # Every job here runs the suites twice over, against two different framework
+  # builds, because those two answer different questions.
+  #
+  #   framework=released  — "do the plugins work against the framework people
+  #                          actually have installed?" This is what protects
+  #                          users who upgrade a plugin without upgrading Pyxle.
+  #
+  #   framework=source    — "would the framework change we are about to release
+  #                          break a plugin?" This is the pre-release signal.
+  #
+  # Until 2026-08 only the first existed: `pyxle-framework` arrived as a
+  # transitive dependency resolved from PyPI, so a fully green plugin CI told us
+  # nothing about the framework release being cut that week. A CI that resolves
+  # its most important dependency from a registry is testing yesterday's
+  # integration. If the source job is red while the released jobs are green, the
+  # framework changed underneath us — look in pyxle-dev/pyxle, not here.
   test:
+    name: test (py${{ matrix.python-version }}, framework=${{ matrix.framework }})
     runs-on: ubuntu-latest
+
+    # The source-framework job BLOCKS on pushes to main and on the scheduled
+    # run — that is where "a framework change broke a plugin" has to stop the
+    # line, before a release goes out.
+    #
+    # On a pull request it is ADVISORY: it still runs and still shows red, but
+    # it does not fail the check suite. A contributor's first pull request must
+    # never go red for a framework change they did not make and cannot fix.
+    # Telling someone "red CI, ignore it, not your fault" teaches them to ignore
+    # CI — which is an unenforced gate arriving from the other side, and we have
+    # spent this week removing those. Pushes and the nightly run already cover
+    # the same ground, so nothing is lost by not blocking here.
+    continue-on-error: ${{ github.event_name == 'pull_request' && matrix.framework == 'source' }}
+
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        framework: [released]
+        # One source-framework job rather than a second full matrix: it answers
+        # a question about the framework, not about Python versions, so the
+        # extra interpreters would buy nothing but runner minutes.
+        include:
+          - python-version: "3.12"
+            framework: source
 
     # Real engines on every run: the live suites (PG + MySQL conformance,
     # auth schema portability + account lifecycle) are what keep the
@@ -67,11 +110,43 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Checked out into a sibling path, not under the workspace root, so the
+      # framework's own tests and config never join this repo's collection.
+      - name: Check out the framework from source
+        if: matrix.framework == 'source'
+        uses: actions/checkout@v7
+        with:
+          repository: pyxle-dev/pyxle
+          ref: main
+          path: .framework-src
+
+      # Installed BEFORE the plugins. Each plugin requires
+      # `pyxle-framework>=0.4.0`; with the editable source install already
+      # satisfying that, pip has no reason to reach for PyPI — which is the
+      # whole point of this job.
+      - name: Install the framework from source
+        if: matrix.framework == 'source'
+        run: pip install -e ./.framework-src
+
       - name: Install packages with all extras
         run: |
           pip install -e "packages/pyxle-db[sqlalchemy,postgres,mysql,dev]"
           pip install -e "packages/pyxle-auth[dev]"
           pip install -e "packages/pyxle-mail[resend,dev]"
+
+      # Proves the job is testing what it claims to. A source job that silently
+      # fell back to the PyPI build would look identical to a passing released
+      # job, which is exactly the failure this whole matrix exists to prevent.
+      - name: Report which framework is under test
+        run: |
+          python - <<'PY'
+          import importlib.metadata as md, pyxle
+          print(f"pyxle-framework {md.version('pyxle-framework')} from {pyxle.__file__}")
+          PY
+          if [ "${{ matrix.framework }}" = "source" ]; then
+            python -c "import pyxle,sys; sys.exit(0 if '.framework-src' in pyxle.__file__ else 1)" \
+              || { echo "::error::framework=source job is not running the source checkout"; exit 1; }
+          fi
 
       - name: pyxle-db tests (SQLite + live PostgreSQL + live MySQL)
         working-directory: packages/pyxle-db
@@ -86,13 +161,23 @@ jobs:
         run: python -m pytest -q
 
       - name: No skipped live suites
-        # A skip here means an engine URL stopped reaching the tests —
-        # the multi-DB claim would silently go unverified again.
+        # A skipped suite is not a passing suite. These tests hide behind TWO
+        # different masks and a check for one will happily report the other as
+        # fine:
+        #   * no engine URL   — PYXLE_DB_TEST_{POSTGRES,MYSQL}_URL unset
+        #   * no driver       — asyncpg / asyncmy not installed
+        # Both produce a green run with the live suites silently absent. On
+        # 2026-08-18 that was 116 invisible tests on pyxle-db alone, hidden by
+        # the driver mask while the recorded note described only the URL one.
+        #
+        # --no-cov because this runs a deliberate subset: the package's coverage
+        # floor is measured over the whole suite, so a subset would trip it for
+        # a reason that has nothing to do with coverage.
         working-directory: packages/pyxle-db
         run: |
-          python -m pytest tests/test_backend_postgresql.py tests/test_backend_mysql.py -q -rs | tee /tmp/live.out
+          python -m pytest tests/test_backend_postgresql.py tests/test_backend_mysql.py -q -rs --no-cov | tee /tmp/live.out
           if grep -q "SKIPPED" /tmp/live.out; then
-            echo "::error::Live-backend tests were skipped; check service containers."
+            echo "::error::Live-backend tests were skipped; check service containers AND that the postgres/mysql extras installed."
             exit 1
           fi
 

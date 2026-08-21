@@ -141,17 +141,25 @@ class AuthSessionMiddleware:
                 if request.method == "POST":
                     return await self._login(request, service, settings)
                 return _method_not_allowed("POST")
-            if path == prefix + "/signup":
-                if request.method == "POST":
-                    return await self._signup(request, service, settings)
-                return _method_not_allowed("POST")
-            if (
-                settings.identifier == "username"
-                and path == prefix + "/username-available"
-            ):
-                if request.method == "GET":
-                    return await self._username_available(request, service)
-                return _method_not_allowed("GET")
+            # Signup is gated separately so closing self-registration does not
+            # also close sign-in. A disabled endpoint is simply not owned here:
+            # the request falls through to the app and gets whatever it returns
+            # for an unrouted path, exactly as when the whole credentials API is
+            # off. Nothing announces that the endpoint was deliberately closed.
+            if _signup_enabled(settings):
+                if path == prefix + "/signup":
+                    if request.method == "POST":
+                        return await self._signup(request, service, settings)
+                    return _method_not_allowed("POST")
+                # Only useful to a signup form, and a standing answer to "does
+                # this username exist?" — so it lives and dies with signup.
+                if (
+                    settings.identifier == "username"
+                    and path == prefix + "/username-available"
+                ):
+                    if request.method == "GET":
+                        return await self._username_available(request, service)
+                    return _method_not_allowed("GET")
 
         # JWT token endpoints — served only when the JWT service is configured.
         jwt_service = ctx.get(_JWT_SERVICE) if ctx is not None else None
@@ -197,7 +205,7 @@ class AuthSessionMiddleware:
         cookie_value = request.cookies.get(settings.cookie_name, "")
         session_cookie = await service.sign_out(cookie_value=cookie_value)
         response: Response = JSONResponse({"ok": True})
-        response.set_cookie(**session_cookie.kwargs())
+        response.set_cookie(**session_cookie.for_request(request).kwargs())
         return response
 
     async def _login(self, request: Request, service: Any, settings: Any) -> Response:
@@ -218,7 +226,7 @@ class AuthSessionMiddleware:
             )
         except AuthError as exc:
             return _auth_error_response(exc)
-        return _authenticated_response(user, cookie)
+        return _authenticated_response(user, cookie, request=request)
 
     async def _username_available(self, request: Request, service: Any) -> Response:
         """``GET {prefix}/username-available?u=<name>`` → ``{"available": bool}``.
@@ -269,7 +277,7 @@ class AuthSessionMiddleware:
             )
         except AuthError as exc:
             return _auth_error_response(exc)
-        return _authenticated_response(user, cookie, status_code=201)
+        return _authenticated_response(user, cookie, status_code=201, request=request)
 
     async def _token(self, request: Request, service: Any, jwt_service: Any) -> Response:
         """Issue a JWT access + refresh pair from email + password (API/mobile).
@@ -327,7 +335,9 @@ def _auth_seed(user: Any, settings: Any) -> dict[str, Any]:
 
     The endpoint map lets the client hook find the (possibly relocated)
     endpoints without hard-coding the default prefix; ``login`` / ``signup``
-    are advertised only when the credentials API is enabled.
+    are advertised only when the credentials API is enabled, and ``signup``
+    only while self-registration is open — so a client that renders its form
+    from this map never shows a signup box that leads nowhere.
     """
     prefix = settings.auth_path_prefix
     endpoints: dict[str, str] = {
@@ -336,9 +346,10 @@ def _auth_seed(user: Any, settings: Any) -> dict[str, Any]:
     }
     if settings.enable_credentials_api:
         endpoints["login"] = prefix + "/login"
-        endpoints["signup"] = prefix + "/signup"
-        if settings.identifier == "username":
-            endpoints["usernameAvailable"] = prefix + "/username-available"
+        if _signup_enabled(settings):
+            endpoints["signup"] = prefix + "/signup"
+            if settings.identifier == "username":
+                endpoints["usernameAvailable"] = prefix + "/username-available"
     # ``identifier`` tells the client which field to render and post — "email"
     # (default) or "username". Keeps the form and the server in lockstep.
     return {
@@ -363,12 +374,19 @@ def _client_ip(request: Request) -> str | None:
 
 
 def _authenticated_response(
-    user: Any, cookie: Any, *, status_code: int = 200
+    user: Any, cookie: Any, *, status_code: int = 200, request: Any = None
 ) -> Response:
-    """Set the session cookie and return the user projection."""
+    """Set the session cookie and return the user projection.
+
+    `request` is optional only so third-party callers that predate it keep
+    working; without it the cookie cannot know whether the connection was TLS,
+    and a `Secure` cookie over plain HTTP is one the browser throws away.
+    """
     response: Response = JSONResponse(
         {"ok": True, "user": user_to_json(user)}, status_code=status_code
     )
+    if request is not None:
+        cookie = cookie.for_request(request)
     response.set_cookie(**cookie.kwargs())
     return response
 
@@ -429,6 +447,17 @@ def _auth_error_response(exc: AuthError) -> Response:
 
 def _bad_request(message: str) -> Response:
     return JSONResponse({"ok": False, "error": message}, status_code=400)
+
+
+def _signup_enabled(settings: Any) -> bool:
+    """Whether self-registration is open.
+
+    ``getattr`` rather than a plain attribute read because ``settings`` is
+    duck-typed here: an app may pass its own settings object, and one built
+    against a pyxle-auth older than this flag should keep the previous
+    behaviour (signup open) rather than raise.
+    """
+    return bool(getattr(settings, "enable_signup", True))
 
 
 def _method_not_allowed(allow: str) -> Response:

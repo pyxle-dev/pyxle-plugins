@@ -431,3 +431,68 @@ async def test_orm_session_unused_request_is_cheap() -> None:
         assert captured["in_tx"] is False  # never opened a transaction
     finally:
         await engine.aclose()
+
+
+async def test_a_bodyless_204_commits(db_path: Path) -> None:
+    """`204 No Content` is the conventional answer to a successful DELETE.
+
+    Pinned because the commit rule keys on having seen the terminal body frame,
+    and it is not obvious from reading it that a status carrying no content
+    still sends one. A future tightening of that rule must not start discarding
+    the writes of every successful DELETE.
+    """
+    db = await _open_notes_db(db_path)
+    try:
+        ctx = _ctx(db)
+
+        async def action(request: Request) -> Response:
+            await request.state.db.execute("INSERT INTO notes (body) VALUES (?)", ("x",))
+            return Response(status_code=204)
+
+        status = await _drive(ctx, action, method="DELETE")
+        assert status == 204
+        assert await _count(db) == 1, "a successful 204 must commit its writes"
+    finally:
+        await db.aclose()
+
+
+async def test_a_304_commits(db_path: Path) -> None:
+    """The other status that carries no content."""
+    db = await _open_notes_db(db_path)
+    try:
+        ctx = _ctx(db)
+
+        async def action(request: Request) -> Response:
+            await request.state.db.execute("INSERT INTO notes (body) VALUES (?)", ("x",))
+            return Response(status_code=304)
+
+        status = await _drive(ctx, action, method="POST")
+        assert status == 304
+        assert await _count(db) == 1
+    finally:
+        await db.aclose()
+
+
+async def test_a_truncated_body_still_rolls_back(db_path: Path) -> None:
+    """The behaviour the completeness check exists for must survive the fix: a
+    200 whose body was cut short mid-stream discards its writes."""
+    from starlette.responses import StreamingResponse
+
+    db = await _open_notes_db(db_path)
+    try:
+        ctx = _ctx(db)
+
+        async def action(request: Request) -> Response:
+            await request.state.db.execute("INSERT INTO notes (body) VALUES (?)", ("x",))
+
+            async def body():
+                yield b"part"
+                raise RuntimeError("connection lost mid-stream")
+
+            return StreamingResponse(body())
+
+        with pytest.raises(RuntimeError):
+            await _drive(ctx, action)
+        assert await _count(db) == 0, "a truncated response must not commit"
+    finally:
+        await db.aclose()

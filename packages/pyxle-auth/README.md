@@ -241,6 +241,12 @@ specification and a template for writing your own adapter.
   screen.
 - **Cookie posture** — `HttpOnly`, `Secure`, `SameSite=Lax` by default.
   Strict mode (the default) refuses to start with `cookie_secure=False`.
+- **Closable registration** — `enableSignup: false` stops serving
+  `POST /auth/signup` while sign-in keeps working, for invite-only and
+  operator-only apps. In username mode `/username-available` closes with
+  it, so it can't answer "does this account exist?" for an app that
+  offers no way to create one. Do this here rather than at a reverse
+  proxy, where the endpoint stays live to anything reaching the origin.
 
 ## Plugin services
 
@@ -279,6 +285,9 @@ Precedence: plugin `settings` in `pyxle.config.json` **>**
 | `cookieSameSite` | `PYXLE_AUTH_COOKIE_SAMESITE` | `Lax` | `Lax` / `Strict` / `None` |
 | `cookieDomain` | `PYXLE_AUTH_COOKIE_DOMAIN` | unset | Share across subdomains |
 | `cookiePath` | — | `/` | Cookie path |
+| `authPathPrefix` | `PYXLE_AUTH_PATH_PREFIX` | `/auth` | Prefix the endpoints are served under |
+| `enableCredentialsApi` | `PYXLE_AUTH_ENABLE_CREDENTIALS_API` | `true` | Serve `POST /login` and `POST /signup` |
+| `enableSignup` | `PYXLE_AUTH_ENABLE_SIGNUP` | `true` | Serve `POST /signup`. `false` closes self-registration but keeps sign-in |
 | `passwordResetTtlSeconds` | `PYXLE_AUTH_PASSWORD_RESET_TTL_SECONDS` | `1800` (30 min) | Reset-token lifetime |
 | `emailVerifyTtlSeconds` | `PYXLE_AUTH_EMAIL_VERIFY_TTL_SECONDS` | `86400` (24 h) | Verify-token lifetime |
 | `rateLimitSignInPerHour` | `PYXLE_AUTH_RL_SIGN_IN_PER_HOUR` | `10` | Per IP and per email |
