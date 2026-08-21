@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-auth"
-version = "0.4.1"
+version = "0.4.2"
 description = "Authentication plugin for Pyxle: email- or username-based identity, argon2id sessions, password reset and email verification flows, RBAC, scoped API tokens, and request guards."
 readme = "README.md"
 requires-python = ">=3.10"
