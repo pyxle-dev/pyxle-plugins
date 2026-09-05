@@ -13,6 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   metadata instead of restated in source, so they cannot drift from
   `pyproject.toml`.
 
+### Fixed
+
+- Concurrent processes racing a pending migration — every worker of a
+  multi-worker server applies migrations at startup — no longer crash with
+  `UNIQUE constraint failed: schema_migrations.id` (or `table ... already
+  exists`). Appliers now serialize per backend: SQLite on `BEGIN IMMEDIATE`
+  with an in-transaction re-check and a locked-retry loop, PostgreSQL on a
+  transaction-scoped `pg_advisory_xact_lock`, MySQL on `GET_LOCK` held across
+  the migration's transaction (needs `pool_max` >= 2; the default is 10). One
+  process applies each migration; the rest verify the recorded checksum
+  matches their file and continue cleanly. Editing an applied migration still
+  fails loudly with `MigrationChecksumMismatch`.
+- Opening a fresh SQLite database from several processes at once could fail
+  with `database is locked`: `PRAGMA journal_mode = WAL` needs a brief
+  exclusive lock and reports busy without consulting the busy handler. The
+  connection-open path now retries the pragma for the same five seconds the
+  busy handler would have waited.
+- The generated Alembic `env.py` now passes `disable_existing_loggers=False`
+  to `fileConfig`, so running Alembic no longer silently mutes every logger
+  the app — and pyxle-db itself — had already created.
+
 ## [0.3.0] - 2026-06-17
 
 Enterprise database support. All additive — no breaking changes.

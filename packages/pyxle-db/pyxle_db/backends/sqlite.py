@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -150,6 +151,39 @@ _PRAGMAS: tuple[tuple[str, str], ...] = (
     ("temp_store", "MEMORY"),
     ("cache_size", "-65536"),
 )
+
+_PRAGMA_RETRY_TIMEOUT: float = 5.0
+"""Seconds to keep retrying a locked PRAGMA at open — mirrors busy_timeout."""
+
+_PRAGMA_RETRY_INTERVAL: float = 0.01
+
+
+def _apply_pragmas(conn: sqlite3.Connection) -> None:
+    """Apply ``_PRAGMAS`` in order, absorbing the journal-mode open race.
+
+    ``PRAGMA journal_mode = WAL`` takes a brief exclusive lock, and it is
+    the one statement where SQLite reports SQLITE_BUSY *without consulting
+    the busy handler* — so when several processes open a fresh database at
+    the same time (every worker of a multi-worker server does at startup),
+    losers would fail instantly with ``database is locked`` despite the
+    5-second connect ``timeout``. Retrying is safe: every pragma here is
+    idempotent. The deadline mirrors the busy handler's own patience.
+    """
+    deadline = time.monotonic() + _PRAGMA_RETRY_TIMEOUT
+    index = 0
+    while index < len(_PRAGMAS):
+        name, value = _PRAGMAS[index]
+        try:
+            conn.execute(f"PRAGMA {name} = {value}")
+        except sqlite3.OperationalError as exc:
+            if (
+                "database is locked" not in str(exc)
+                or time.monotonic() >= deadline
+            ):
+                raise
+            time.sleep(_PRAGMA_RETRY_INTERVAL)
+            continue
+        index += 1
 
 
 # ---------------------------------------------------------------------------
@@ -460,8 +494,7 @@ class SqliteBackend(Backend):
                 check_same_thread=False,
                 timeout=5.0,
             )
-            for name, value in _PRAGMAS:
-                conn.execute(f"PRAGMA {name} = {value}")
+            _apply_pragmas(conn)
         with self._tracking_lock:
             self._connections.append(conn)
         return conn
