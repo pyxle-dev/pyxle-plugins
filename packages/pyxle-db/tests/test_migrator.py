@@ -11,10 +11,12 @@ those servers — and proves the migrator uses only the public facade API.
 from __future__ import annotations
 
 import hashlib
+import logging
+import re
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterable, Sequence
+from typing import Any, AsyncIterator, Iterable, Iterator, Sequence
 
 import pytest
 
@@ -34,8 +36,12 @@ from pyxle_db.backends.base import (
     BackendTransaction,
     Dialect,
 )
-from pyxle_db.errors import DatabaseError, IntegrityError
-from pyxle_db.migrator import select_migration_files
+from pyxle_db.errors import DatabaseError, IntegrityError, OperationalError
+from pyxle_db.migrator import (
+    _mysql_lock_name,
+    _postgres_lock_keys,
+    select_migration_files,
+)
 from pyxle_db.rows import Row
 from pyxle_db.url import DatabaseConfig
 
@@ -46,10 +52,62 @@ MYSQL_URL = "mysql://app:secret@localhost/app"
 # ---------------------------------------------------------------------------
 # Stub backend — SQLite storage behind any dialect label
 
+_EVENTS: list[tuple[Any, ...]] = []
+"""Chronological trace of stub activity, cleared per test by ``_clear_events``.
+
+Entries are ``("sql", <native statement>)`` for every statement reaching the
+stub, plus ``("pg_advisory_xact_lock", high, low)`` / ``("get_lock", name,
+timeout)`` / ``("release_lock", name)`` when the registered stand-ins for the
+server lock functions execute — letting tests assert the migrator's
+per-dialect lock protocol (which lock, keyed how, ordered where) without a
+live server.
+"""
+
+
+def _register_lock_stand_ins(conn: sqlite3.Connection) -> None:
+    """SQLite stand-ins for the server-side lock functions.
+
+    Single-process stub tests never contend, so each stand-in records the
+    call and reports success; the blocking semantics belong to the live
+    suites in ``test_migrator_concurrency.py``.
+    """
+
+    def pg_advisory_xact_lock(high: int, low: int) -> None:
+        _EVENTS.append(("pg_advisory_xact_lock", high, low))
+
+    def get_lock(name: str, timeout: int) -> int:
+        _EVENTS.append(("get_lock", name, timeout))
+        return 1
+
+    def release_lock(name: str) -> int:
+        _EVENTS.append(("release_lock", name))
+        return 1
+
+    conn.create_function("pg_advisory_xact_lock", 2, pg_advisory_xact_lock)
+    conn.create_function("get_lock", 2, get_lock)
+    conn.create_function("release_lock", 1, release_lock)
+
+
+def _to_sqlite(sql: str) -> str:
+    """Rewrite dialect-native SQL just enough for sqlite3 to run it.
+
+    Placeholders: the facade hands backends native SQL — ``$1`` on
+    PostgreSQL, ``%s`` on MySQL — while the stub binds positionally with
+    ``?``. DDL: PostgreSQL's tracking-table default ``now()`` is not a
+    constant to SQLite; ``CURRENT_TIMESTAMP`` is its equivalent.
+    """
+    sql = re.sub(r"\$\d+", "?", sql).replace("%s", "?")
+    return sql.replace("DEFAULT now()", "DEFAULT CURRENT_TIMESTAMP")
+
 
 def _run(conn: sqlite3.Connection, sql: str, params: Sequence[Any]) -> sqlite3.Cursor:
+    _EVENTS.append(("sql", sql))
+    if sql.startswith("SET TRANSACTION"):
+        # Server-side session statement with no SQLite equivalent; the
+        # trace entry above is its observable effect.
+        return conn.execute("SELECT 0 WHERE 0")
     try:
-        return conn.execute(sql, tuple(params))
+        return conn.execute(_to_sqlite(sql), tuple(params))
     except sqlite3.IntegrityError as exc:
         raise IntegrityError(str(exc)) from exc
     except sqlite3.Error as exc:
@@ -95,10 +153,12 @@ class _StubBackend(Backend):
         self.dialect = dialect
         self._path = config.path or ":memory:"
         self._conn: sqlite3.Connection | None = None
+        self._tx_depth = 0
 
     async def connect(self) -> None:
         if self._conn is None:
             self._conn = sqlite3.connect(self._path, isolation_level=None)
+            _register_lock_stand_ins(self._conn)
 
     async def aclose(self) -> None:
         if self._conn is not None:
@@ -132,18 +192,35 @@ class _StubBackend(Backend):
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[BackendTransaction]:
+        # Reentrant: the migrator's MySQL path opens an inner transaction
+        # while its session-lock guard transaction is still open. The real
+        # backend uses two pooled connections for that; the stub has one,
+        # so only the outermost scope owns BEGIN/COMMIT/ROLLBACK.
         conn = self._connection()
-        conn.execute("BEGIN")
+        outermost = self._tx_depth == 0
+        if outermost:
+            conn.execute("BEGIN")
+        self._tx_depth += 1
         try:
             yield _StubTransaction(conn)
         except BaseException:
-            conn.execute("ROLLBACK")
+            self._tx_depth -= 1
+            if outermost:
+                conn.execute("ROLLBACK")
             raise
-        conn.execute("COMMIT")
+        self._tx_depth -= 1
+        if outermost:
+            conn.execute("COMMIT")
 
     def _connection(self) -> sqlite3.Connection:
         assert self._conn is not None, "backend used before connect()"
         return self._conn
+
+
+@pytest.fixture(autouse=True)
+def _clear_events() -> Iterator[None]:
+    _EVENTS.clear()
+    yield
 
 
 @pytest.fixture(autouse=True)
@@ -574,3 +651,357 @@ async def test_invalid_tracking_table_rejected(tmp_path):
     db = Database(":memory:")
     with pytest.raises(MigrationError, match="tracking_table"):
         Migrator(db, d, tracking_table="bad-name; DROP TABLE x")
+
+
+# ---------------------------------------------------------------------------
+# Concurrent appliers — lost races and the per-dialect lock protocol.
+#
+# Multi-worker servers apply migrations from every worker's startup, so two
+# processes can race one pending migration. These tests drive the exact
+# interleaving deterministically through the stub (one scans "pending", the
+# other applies, the first proceeds on its stale scan); the real-contention
+# and multi-process variants live in test_migrator_concurrency.py.
+
+
+async def test_lost_race_is_a_clean_skip(
+    mdir: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A process whose pending scan went stale must skip, not crash."""
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db_path = tmp_path / "race.db"
+    winner_db = Database(db_path)
+    loser_db = Database(db_path)
+    try:
+        loser = Migrator(loser_db, mdir)
+        stale = loser.discover()[0]  # scanned before anything was applied
+        winner_ids = [m.id for m in await Migrator(winner_db, mdir).apply_all()]
+        assert winner_ids == ["0001-init"]
+
+        with caplog.at_level(logging.INFO, logger="pyxle_db.migrator"):
+            assert await loser._apply_one(stale) is False
+        assert "already applied by another process" in caplog.text
+
+        rows = await loser_db.fetchall("SELECT id FROM schema_migrations")
+        assert [row["id"] for row in rows] == ["0001-init"]
+        # The loser's own apply_all stays an honest no-op afterwards.
+        assert await loser.apply_all() == []
+    finally:
+        await winner_db.aclose()
+        await loser_db.aclose()
+
+
+async def test_lost_race_with_different_content_still_fails(
+    mdir: Path, tmp_path: Path
+) -> None:
+    """Losing the race is only safe when the winner applied the SAME file."""
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db_path = tmp_path / "race.db"
+    loser_db = Database(db_path)
+    other_db = Database(db_path)
+    try:
+        loser = Migrator(loser_db, mdir)
+        stale = loser.discover()[0]
+        # Another process recorded 0001-init from different content.
+        await other_db.execute(SQLITE_DIALECT.migrations_table_ddl)
+        await other_db.execute(
+            "INSERT INTO schema_migrations (id, checksum) VALUES (?, ?)",
+            ("0001-init", "f" * 64),
+        )
+        with pytest.raises(MigrationChecksumMismatch) as excinfo:
+            await loser._apply_one(stale)
+        assert excinfo.value.recorded_hash == "f" * 64
+        assert excinfo.value.actual_hash == stale.checksum
+    finally:
+        await loser_db.aclose()
+        await other_db.aclose()
+
+
+async def test_migration_whose_sql_violates_a_constraint_still_fails(
+    mdir: Path, tmp_path: Path
+) -> None:
+    """An IntegrityError from the migration's own SQL is a real failure —
+    the lost-race resolver must not mistake it for a race."""
+    _write(
+        mdir,
+        "0001-init.sql",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t (id) VALUES (1);",
+    )
+    _write(mdir, "0002-dup.sql", "INSERT INTO t (id) VALUES (1);")
+    db_path = tmp_path / "m.db"
+    with pytest.raises(MigrationError, match="'0002-dup' failed"):
+        await connect(db_path, migrations_dir=mdir)
+
+    db = Database(db_path)
+    try:
+        rows = await db.fetchall("SELECT id FROM schema_migrations")
+        assert [row["id"] for row in rows] == ["0001-init"]
+    finally:
+        await db.aclose()
+
+
+async def test_resolve_tracking_conflict_matching_row_skips(
+    mdir: Path, tmp_path: Path
+) -> None:
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db = Database(tmp_path / "m.db")
+    try:
+        migrator = Migrator(db, mdir)
+        migration = migrator.discover()[0]
+        await db.execute(SQLITE_DIALECT.migrations_table_ddl)
+        await db.execute(
+            "INSERT INTO schema_migrations (id, checksum) VALUES (?, ?)",
+            (migration.id, migration.checksum),
+        )
+        original = IntegrityError("UNIQUE constraint failed: schema_migrations.id")
+        assert await migrator._resolve_tracking_conflict(migration, original) is False
+    finally:
+        await db.aclose()
+
+
+async def test_resolve_tracking_conflict_mismatched_row_raises(
+    mdir: Path, tmp_path: Path
+) -> None:
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db = Database(tmp_path / "m.db")
+    try:
+        migrator = Migrator(db, mdir)
+        migration = migrator.discover()[0]
+        await db.execute(SQLITE_DIALECT.migrations_table_ddl)
+        await db.execute(
+            "INSERT INTO schema_migrations (id, checksum) VALUES (?, ?)",
+            (migration.id, "f" * 64),
+        )
+        original = IntegrityError("UNIQUE constraint failed: schema_migrations.id")
+        with pytest.raises(MigrationChecksumMismatch):
+            await migrator._resolve_tracking_conflict(migration, original)
+    finally:
+        await db.aclose()
+
+
+async def test_resolve_tracking_conflict_without_row_wraps_original(
+    mdir: Path, tmp_path: Path
+) -> None:
+    """No tracking row means the IntegrityError came from the migration's
+    own SQL — it must fail exactly like any failing migration."""
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db = Database(tmp_path / "m.db")
+    try:
+        migrator = Migrator(db, mdir)
+        migration = migrator.discover()[0]
+        await db.execute(SQLITE_DIALECT.migrations_table_ddl)
+        original = IntegrityError("NOT NULL constraint failed: t.v")
+        with pytest.raises(MigrationError, match="'0001-init' failed") as excinfo:
+            await migrator._resolve_tracking_conflict(migration, original)
+        assert excinfo.value.__cause__ is original
+        assert not isinstance(excinfo.value, MigrationChecksumMismatch)
+    finally:
+        await db.aclose()
+
+
+async def test_sqlite_locked_transaction_is_retried(
+    mdir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """'database is locked' (another process held BEGIN IMMEDIATE past
+    busy_timeout) means wait and re-enter — never a startup failure."""
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db = Database(tmp_path / "m.db")
+    try:
+        migrator = Migrator(db, mdir)
+        migration = migrator.discover()[0]
+        await db.execute(SQLITE_DIALECT.migrations_table_ddl)
+        real_transaction = db.transaction
+        attempts = 0
+
+        def locked_once():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OperationalError("database is locked")
+            return real_transaction()
+
+        monkeypatch.setattr(db, "transaction", locked_once)
+        assert await migrator._apply_one(migration) is True
+        assert attempts == 2
+    finally:
+        await db.aclose()
+
+
+async def test_operational_error_on_server_backends_is_not_retried(
+    mdir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The locked-retry loop is SQLite-specific; a server backend's
+    OperationalError stays a hard failure, exactly as before."""
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db = Database(PG_URL)
+    try:
+        migrator = Migrator(db, mdir)
+        migration = migrator.discover()[0]
+
+        def refused():
+            raise OperationalError("connection refused")
+
+        monkeypatch.setattr(db, "transaction", refused)
+        with pytest.raises(MigrationError, match="connection refused"):
+            await migrator._apply_one(migration)
+    finally:
+        await db.aclose()
+
+
+async def test_tracking_table_ddl_race_is_tolerated(
+    mdir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PostgreSQL can surface a raced CREATE TABLE IF NOT EXISTS as a
+    duplicate-key error on its catalogs; when the table exists, the
+    applier must shrug it off."""
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db_path = tmp_path / "m.db"
+    first = await connect(db_path, migrations_dir=mdir)  # table exists now
+    await first.aclose()
+
+    _write(mdir, "0002-more.sql", "CREATE TABLE u (id INTEGER);")
+    db = Database(db_path)
+    try:
+        real_execute = db.execute
+
+        async def racy_execute(sql, params=None):
+            if sql.startswith("CREATE TABLE IF NOT EXISTS schema_migrations"):
+                raise IntegrityError(
+                    "duplicate key value violates unique constraint "
+                    '"pg_type_typname_nsp_index"'
+                )
+            return await real_execute(sql, params)
+
+        monkeypatch.setattr(db, "execute", racy_execute)
+        applied = [m.id for m in await Migrator(db, mdir).apply_all()]
+        assert applied == ["0002-more"]
+    finally:
+        await db.aclose()
+
+
+def test_lock_identities_are_stable_and_namespaced() -> None:
+    """Pinned on purpose: old and new plugin versions must contend on the
+    SAME lock during a rolling deploy, so these values may never change."""
+    assert _postgres_lock_keys("schema_migrations") == (1929704322, -1835172326)
+    assert (
+        _mysql_lock_name("schema_migrations")
+        == "pyxle_db_migrations_7304f382929d7e1a7818b4330b666537"
+    )
+    # Distinct histories on one database never serialize against each other.
+    assert _postgres_lock_keys("schema_migrations_pyxle_auth") != (
+        _postgres_lock_keys("schema_migrations")
+    )
+    assert _mysql_lock_name("schema_migrations_pyxle_auth") != (
+        _mysql_lock_name("schema_migrations")
+    )
+    for key in _postgres_lock_keys("schema_migrations"):
+        assert -(2**31) <= key < 2**31
+    name = _mysql_lock_name("schema_migrations")
+    assert len(name) <= 64
+    assert re.fullmatch(r"[a-z0-9_]+", name)
+
+
+async def test_postgresql_applier_locks_inside_the_transaction(
+    mdir: Path,
+) -> None:
+    """On PostgreSQL the applier must take the advisory lock inside the
+    migration's transaction, re-check under it, and only then apply."""
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db = Database(PG_URL)
+    try:
+        applied = [m.id for m in await Migrator(db, mdir).apply_all()]
+        assert applied == ["0001-init"]
+
+        high, low = _postgres_lock_keys("schema_migrations")
+        assert ("pg_advisory_xact_lock", high, low) in _EVENTS
+
+        sqls = [entry[1] for entry in _EVENTS if entry[0] == "sql"]
+        isolation = next(
+            i for i, s in enumerate(sqls) if s.startswith("SET TRANSACTION")
+        )
+        lock = next(
+            i for i, s in enumerate(sqls) if "pg_advisory_xact_lock" in s
+        )
+        recheck = next(
+            i for i, s in enumerate(sqls) if s.startswith("SELECT checksum")
+        )
+        insert = next(
+            i
+            for i, s in enumerate(sqls)
+            if s.startswith("INSERT INTO schema_migrations")
+        )
+        assert isolation < lock < recheck < insert
+    finally:
+        await db.aclose()
+
+
+async def test_postgresql_lost_race_is_a_clean_skip(mdir: Path) -> None:
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db = Database(PG_URL)
+    try:
+        loser = Migrator(db, mdir)
+        stale = loser.discover()[0]
+        await Migrator(db, mdir).apply_all()
+        assert await loser._apply_one(stale) is False
+        assert await loser.apply_all() == []
+    finally:
+        await db.aclose()
+
+
+async def test_mysql_applier_holds_the_session_lock_across_the_migration(
+    mdir: Path,
+) -> None:
+    """On MySQL the applier must take GET_LOCK before touching anything and
+    release only after the migration and its tracking insert."""
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db = Database(MYSQL_URL)
+    try:
+        applied = [m.id for m in await Migrator(db, mdir).apply_all()]
+        assert applied == ["0001-init"]
+
+        name = _mysql_lock_name("schema_migrations")
+        assert any(e[0] == "get_lock" and e[1] == name for e in _EVENTS)
+        assert ("release_lock", name) in _EVENTS
+
+        sqls = [entry[1] for entry in _EVENTS if entry[0] == "sql"]
+        lock = next(i for i, s in enumerate(sqls) if "GET_LOCK" in s)
+        recheck = next(
+            i for i, s in enumerate(sqls) if s.startswith("SELECT checksum")
+        )
+        insert = next(
+            i
+            for i, s in enumerate(sqls)
+            if s.startswith("INSERT INTO schema_migrations")
+        )
+        release = next(i for i, s in enumerate(sqls) if "RELEASE_LOCK" in s)
+        assert lock < recheck < insert < release
+    finally:
+        await db.aclose()
+
+
+async def test_mysql_lock_released_when_the_migration_fails(mdir: Path) -> None:
+    _write(
+        mdir,
+        "0001-bad.sql",
+        "CREATE TABLE t (id INTEGER); CREATE TABLE t (id INTEGER);",
+    )
+    db = Database(MYSQL_URL)
+    try:
+        with pytest.raises(MigrationError, match="'0001-bad' failed"):
+            await Migrator(db, mdir).apply_all()
+        name = _mysql_lock_name("schema_migrations")
+        assert ("release_lock", name) in _EVENTS
+    finally:
+        await db.aclose()
+
+
+async def test_mysql_lost_race_is_a_clean_skip(mdir: Path) -> None:
+    _write(mdir, "0001-init.sql", "CREATE TABLE t (id INTEGER);")
+    db = Database(MYSQL_URL)
+    try:
+        loser = Migrator(db, mdir)
+        stale = loser.discover()[0]
+        await Migrator(db, mdir).apply_all()
+        assert await loser._apply_one(stale) is False
+        assert await loser.apply_all() == []
+    finally:
+        await db.aclose()

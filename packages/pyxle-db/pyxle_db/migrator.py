@@ -22,6 +22,15 @@ Conventions:
   database may legitimately record different checksums for the same id.
   Editing a migration after it was applied (including adding an override
   for an already-applied id) is detected per database and rejected.
+* Exactly once holds under concurrency too: several processes — e.g.
+  every worker of ``pyxle serve --workers N`` running the plugin's
+  startup — may call :meth:`Migrator.apply_all` against one database at
+  the same time. Appliers serialize on a per-backend lock (SQLite
+  ``BEGIN IMMEDIATE``, PostgreSQL ``pg_advisory_xact_lock``, MySQL
+  ``GET_LOCK``); one process runs a given migration's SQL, and the rest
+  observe it as applied, verify the recorded checksum matches their
+  effective file, and continue. A checksum difference still fails
+  loudly.
 * Each migration runs in its own transaction: statements execute
   sequentially and the ``schema_migrations`` insert rides the same
   transaction, so a failure rolls back that migration completely and
@@ -34,18 +43,37 @@ Conventions:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from pyxle_db.backends import MYSQL_DIALECT, POSTGRESQL_DIALECT, SQLITE_DIALECT
-from pyxle_db.database import Database
-from pyxle_db.errors import MigrationChecksumMismatch, MigrationError
+from pyxle_db.database import Database, Transaction
+from pyxle_db.errors import (
+    DatabaseError,
+    IntegrityError,
+    MigrationChecksumMismatch,
+    MigrationError,
+    OperationalError,
+)
 from pyxle_db.sql import split_statements
 
+_logger = logging.getLogger("pyxle_db.migrator")
+
 _IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+# How long a SQLite applier sleeps before re-entering once another process
+# has held the write lock past the connection's ``busy_timeout``, and how
+# long each MySQL ``GET_LOCK`` attempt waits before looping. Neither is a
+# deadline — a waiter blocks until the lock frees, matching the
+# block-until-released semantics of PostgreSQL's advisory lock; a dead
+# holder's lock is always released by its process exit / connection drop.
+_SQLITE_LOCKED_RETRY_SECONDS = 0.1
+_MYSQL_LOCK_WAIT_SECONDS = 5
 
 _DIALECT_NAMES = frozenset(
     dialect.name for dialect in (SQLITE_DIALECT, POSTGRESQL_DIALECT, MYSQL_DIALECT)
@@ -184,6 +212,34 @@ def select_migration_files(files: Iterable[Path], dialect_name: str) -> list[Pat
     return [f.path for f in sorted(effective.values(), key=lambda f: f.prefix)]
 
 
+def _lock_digest(tracking_table: str) -> bytes:
+    """A stable cross-process identity for one migration history.
+
+    Derived with :mod:`hashlib` (never ``hash()``, which is per-process)
+    and keyed on the tracking table so independent migration sources on
+    one database — the host app's ``schema_migrations`` and pyxle-auth's
+    ``schema_migrations_pyxle_auth`` — never serialize against each
+    other, and neither do two apps sharing a server.
+    """
+    return hashlib.sha256(
+        b"pyxle_db.migrations:" + tracking_table.encode("ascii")
+    ).digest()
+
+
+def _postgres_lock_keys(tracking_table: str) -> tuple[int, int]:
+    """The two signed int32 keys for ``pg_advisory_xact_lock(int, int)``."""
+    digest = _lock_digest(tracking_table)
+    return (
+        int.from_bytes(digest[:4], "big", signed=True),
+        int.from_bytes(digest[4:8], "big", signed=True),
+    )
+
+
+def _mysql_lock_name(tracking_table: str) -> str:
+    """The ``GET_LOCK`` name — 52 chars, under MySQL's 64-char limit."""
+    return "pyxle_db_migrations_" + _lock_digest(tracking_table).hex()[:32]
+
+
 class Migrator:
     """Applies ordered migrations to a :class:`Database` of any backend.
 
@@ -260,7 +316,11 @@ class Migrator:
 
         Safe to call on every app startup: a migration is applied exactly
         once and subsequent calls become a no-op for anything already
-        recorded.
+        recorded. That holds across processes too — when several server
+        workers race the same pending migration, they serialize on a
+        database lock, exactly one applies it, and the others verify the
+        recorded checksum and skip it. Only migrations applied by *this*
+        call are returned.
 
         Raises :class:`MigrationChecksumMismatch` if a previously-applied
         migration's effective content on disk no longer matches what was
@@ -274,8 +334,8 @@ class Migrator:
         for migration in discovered:
             if migration.id in applied:
                 continue
-            await self._apply_one(migration)
-            applied_now.append(migration)
+            if await self._apply_one(migration):
+                applied_now.append(migration)
         return applied_now
 
     async def status(self) -> MigrationStatus:
@@ -301,7 +361,14 @@ class Migrator:
         ddl = self._db.dialect.migrations_table_ddl.replace(
             "schema_migrations", self._table
         )
-        await self._db.execute(ddl)
+        try:
+            await self._db.execute(ddl)
+        except IntegrityError:
+            # Concurrent processes can race the CREATE TABLE IF NOT EXISTS
+            # itself — PostgreSQL surfaces the loser's DDL as a duplicate-key
+            # violation on the system catalogs. The winner created the
+            # table; the SELECT below fails loudly if it truly is missing.
+            pass
         rows = await self._db.fetchall(f"SELECT id, checksum FROM {self._table}")
         applied = {row["id"]: row["checksum"] for row in rows}
 
@@ -324,21 +391,219 @@ class Migrator:
                 )
         return applied
 
-    async def _apply_one(self, migration: Migration) -> None:
-        # One transaction per migration: the script's statements and the
-        # schema_migrations insert commit together or not at all.
+    async def _apply_one(self, migration: Migration) -> bool:
+        """Apply one migration; return True iff *this* process applied it.
+
+        Concurrent appliers serialize on a per-backend lock (see
+        :meth:`_apply_in_transaction` and :meth:`_apply_under_mysql_lock`),
+        and the first statement inside the lock re-checks the tracking
+        table — so a process whose pending scan went stale finds the
+        winner's row, verifies its checksum, and returns False instead of
+        re-running the SQL. A checksum difference raises
+        :class:`MigrationChecksumMismatch`; any other failure is wrapped
+        in :class:`MigrationError` exactly as before.
+        """
         statements = split_statements(
             migration.sql, dialect_name=self._db.dialect.name
         )
-        try:
-            async with self._db.transaction() as tx:
-                for statement in statements:
-                    await tx.execute(statement)
+        logged_waiting = False
+        while True:
+            try:
+                if self._db.dialect.name == "mysql":
+                    return await self._apply_under_mysql_lock(
+                        migration, statements
+                    )
+                return await self._apply_in_transaction(migration, statements)
+            except MigrationError:
+                # Raised by the migrator itself (checksum mismatch, lock
+                # failure) — already precise; never re-wrap it.
+                raise
+            except IntegrityError as exc:
+                return await self._resolve_tracking_conflict(migration, exc)
+            except OperationalError as exc:
+                if (
+                    self._db.dialect.name == "sqlite"
+                    and "database is locked" in str(exc)
+                ):
+                    # Another process has held BEGIN IMMEDIATE past this
+                    # connection's busy_timeout — it is applying migrations
+                    # right now. Wait it out and re-enter; the
+                    # in-transaction re-check resolves what remains.
+                    if not logged_waiting:
+                        _logger.info(
+                            "Migration %r: database locked by another "
+                            "process applying migrations; waiting",
+                            migration.id,
+                        )
+                        logged_waiting = True
+                    await asyncio.sleep(_SQLITE_LOCKED_RETRY_SECONDS)
+                    continue
+                raise MigrationError(
+                    f"Migration {migration.id!r} failed: {exc}"
+                ) from exc
+            except Exception as exc:
+                raise MigrationError(
+                    f"Migration {migration.id!r} failed: {exc}"
+                ) from exc
+
+    async def _apply_in_transaction(
+        self, migration: Migration, statements: list[str]
+    ) -> bool:
+        """Run one migration inside one serialized transaction.
+
+        One transaction per migration: the script's statements and the
+        tracking insert commit together or not at all. Serialization:
+
+        * SQLite — :meth:`Database.transaction` opens with
+          ``BEGIN IMMEDIATE``, so the write lock itself is the mutex; the
+          re-check below reads after the lock is granted and therefore
+          sees a winner's committed row.
+        * PostgreSQL — a transaction-scoped advisory lock keyed on the
+          tracking table; it blocks until free and releases atomically at
+          commit, exactly when the tracking row becomes visible to the
+          next waiter's re-check.
+        * MySQL — no transaction-scoped lock can cover DDL (which commits
+          implicitly), so :meth:`_apply_under_mysql_lock` wraps this same
+          body in a session lock and this transaction is the inner one;
+          its REPEATABLE READ snapshot starts at the re-check, after the
+          lock was acquired.
+        """
+        async with self._db.transaction() as tx:
+            if self._db.dialect.name == "postgresql":
+                # READ COMMITTED gives every statement its own snapshot, so
+                # the re-check sees the winner's commit even where the
+                # server's default isolation is stricter (REPEATABLE READ
+                # would pin the snapshot before the lock wait finished and
+                # hide the winner's row).
                 await tx.execute(
-                    f"INSERT INTO {self._table} (id, checksum) VALUES (?, ?)",
-                    (migration.id, migration.checksum),
+                    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
                 )
-        except Exception as exc:
+                key_high, key_low = _postgres_lock_keys(self._table)
+                await tx.fetchone(
+                    "SELECT pg_advisory_xact_lock(?, ?)", (key_high, key_low)
+                )
+            row = await tx.fetchone(
+                f"SELECT checksum FROM {self._table} WHERE id = ?",
+                (migration.id,),
+            )
+            if row is not None:
+                self._verify_lost_race(migration, row["checksum"])
+                return False
+            for statement in statements:
+                await tx.execute(statement)
+            await tx.execute(
+                f"INSERT INTO {self._table} (id, checksum) VALUES (?, ?)",
+                (migration.id, migration.checksum),
+            )
+        return True
+
+    async def _apply_under_mysql_lock(
+        self, migration: Migration, statements: list[str]
+    ) -> bool:
+        """Serialize one migration on a MySQL named session lock.
+
+        The outer transaction scope exists only to pin one pooled
+        connection for ``GET_LOCK``/``RELEASE_LOCK`` — a session lock must
+        be released on the connection that took it, and the pool would
+        otherwise hand the two statements different connections. The
+        migration itself runs through :meth:`_apply_in_transaction` on a
+        second pooled connection, and the lock is released strictly
+        *after* that inner commit: released any earlier, the next
+        waiter's REPEATABLE READ snapshot could predate the tracking
+        insert and the race would be back. Startup migrations on MySQL
+        therefore need ``pool_max`` >= 2 (the default is 10). A lock
+        holder that dies is cleaned up by the server when its connection
+        drops.
+        """
+        lock_name = _mysql_lock_name(self._table)
+        async with self._db.transaction() as guard:
+            await self._acquire_mysql_lock(guard, lock_name, migration)
+            try:
+                return await self._apply_in_transaction(migration, statements)
+            finally:
+                await self._release_mysql_lock(guard, lock_name)
+
+    async def _acquire_mysql_lock(
+        self, guard: Transaction, lock_name: str, migration: Migration
+    ) -> None:
+        logged_waiting = False
+        while True:
+            row = await guard.fetchone(
+                "SELECT GET_LOCK(?, ?)", (lock_name, _MYSQL_LOCK_WAIT_SECONDS)
+            )
+            status = None if row is None else row[0]
+            if status == 1:
+                return
+            if status == 0:
+                # Timed out while another process applies migrations —
+                # keep waiting, exactly like the other backends do.
+                if not logged_waiting:
+                    _logger.info(
+                        "Migration %r: waiting for another process "
+                        "applying migrations",
+                        migration.id,
+                    )
+                    logged_waiting = True
+                continue
+            raise MigrationError(
+                f"Migration {migration.id!r} failed: could not acquire "
+                f"MySQL lock {lock_name!r} (GET_LOCK returned {status!r})"
+            )
+
+    async def _release_mysql_lock(
+        self, guard: Transaction, lock_name: str
+    ) -> None:
+        try:
+            await guard.fetchone("SELECT RELEASE_LOCK(?)", (lock_name,))
+        except DatabaseError:
+            # Never mask the migration's own outcome. A failed release
+            # means the guard connection is gone — and the server frees
+            # the lock with it.
+            _logger.warning(
+                "Could not release MySQL migration lock %r; the server "
+                "frees it when the holding connection closes",
+                lock_name,
+            )
+
+    async def _resolve_tracking_conflict(
+        self, migration: Migration, exc: IntegrityError
+    ) -> bool:
+        """Decide what an ``IntegrityError`` during application meant.
+
+        Belt-and-braces behind the per-backend locks, for any
+        interleaving they cannot see (e.g. exotic isolation settings).
+        The failed transaction has rolled back; re-read the tracking
+        table on a fresh autocommit connection. A row recorded by
+        another process means this was a lost race — verify its checksum
+        and skip. No row means the error came from the migration's own
+        SQL: a real failure, wrapped exactly as before.
+        """
+        row = await self._db.fetchone(
+            f"SELECT checksum FROM {self._table} WHERE id = ?",
+            (migration.id,),
+        )
+        if row is None:
             raise MigrationError(
                 f"Migration {migration.id!r} failed: {exc}"
             ) from exc
+        self._verify_lost_race(migration, row["checksum"])
+        return False
+
+    def _verify_lost_race(self, migration: Migration, recorded: str) -> None:
+        """Another process applied ``migration`` first — was it the same file?
+
+        Matching checksum: a clean skip. Different checksum: the same id
+        was applied from different content somewhere — the drift
+        protection must fail as loudly here as it does on a plain
+        re-run.
+        """
+        if recorded != migration.checksum:
+            raise MigrationChecksumMismatch(
+                migration_id=migration.id,
+                recorded_hash=recorded,
+                actual_hash=migration.checksum,
+            )
+        _logger.info(
+            "Migration %r was already applied by another process; skipping",
+            migration.id,
+        )

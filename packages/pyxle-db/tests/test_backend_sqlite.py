@@ -332,3 +332,52 @@ async def test_integrity_error_maps_at_backend_level(backend: SqliteBackend) -> 
     await backend.execute("CREATE TABLE t (v INTEGER NOT NULL)")
     with pytest.raises(IntegrityError):
         await backend.execute("INSERT INTO t (v) VALUES (NULL)")
+
+
+# ---------------------------------------------------------------------------
+# Connection-open pragma race
+
+
+class _FlakyPragmaConn:
+    """Minimal connection stand-in for the pragma-retry logic."""
+
+    def __init__(self, locked_failures: int) -> None:
+        self.locked_failures = locked_failures
+        self.executed: list[str] = []
+
+    def execute(self, sql: str) -> None:
+        if "journal_mode" in sql and self.locked_failures > 0:
+            self.locked_failures -= 1
+            raise sqlite3.OperationalError("database is locked")
+        self.executed.append(sql)
+
+
+def test_apply_pragmas_retries_a_locked_journal_mode() -> None:
+    """``PRAGMA journal_mode = WAL`` can report SQLITE_BUSY without
+    consulting the busy handler when several processes open a fresh
+    database together (every worker of a multi-worker server at startup);
+    the open path must wait it out, not fail the worker."""
+    conn = _FlakyPragmaConn(locked_failures=3)
+    sqlite_backend_module._apply_pragmas(conn)
+    assert [s.split(" = ")[0] for s in conn.executed] == [
+        f"PRAGMA {name}" for name, _ in sqlite_backend_module._PRAGMAS
+    ]
+
+
+def test_apply_pragmas_still_fails_after_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sqlite_backend_module, "_PRAGMA_RETRY_TIMEOUT", 0.05)
+    monkeypatch.setattr(sqlite_backend_module, "_PRAGMA_RETRY_INTERVAL", 0.005)
+    conn = _FlakyPragmaConn(locked_failures=10_000)
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        sqlite_backend_module._apply_pragmas(conn)
+
+
+def test_apply_pragmas_propagates_non_lock_errors() -> None:
+    class _Broken:
+        def execute(self, sql: str) -> None:
+            raise sqlite3.OperationalError("disk I/O error")
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        sqlite_backend_module._apply_pragmas(_Broken())

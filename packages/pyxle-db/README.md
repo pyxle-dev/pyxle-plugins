@@ -150,6 +150,12 @@ migrations/
   genuinely needs backend-specific DDL.
 - Each migration runs in its own transaction and is applied exactly once
   per database, recorded in `schema_migrations` with the file's SHA-256.
+- Applying is concurrency-safe: when several processes race the same
+  pending migration (each worker of a multi-worker server migrates on
+  startup), they serialize on a database lock — SQLite `BEGIN IMMEDIATE`,
+  PostgreSQL `pg_advisory_xact_lock`, MySQL `GET_LOCK`. One process
+  applies it; the rest verify the recorded checksum and continue. On
+  MySQL this needs `pool_max` >= 2 (the default is 10).
 - **Checksum policy:** every startup re-hashes applied migrations. An
   edited file raises `MigrationChecksumMismatch`; a deleted one raises
   `MigrationError`. Once applied anywhere, a migration is immutable —
