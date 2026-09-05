@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyxle-db"
-version = "0.3.0"
+version = "0.3.1"
 description = "Database plugin for Pyxle: SQLite, PostgreSQL, and MySQL with one explicit-SQL API, portable qmark placeholders, and checksum-tracked migrations."
 readme = "README.md"
 requires-python = ">=3.10"
